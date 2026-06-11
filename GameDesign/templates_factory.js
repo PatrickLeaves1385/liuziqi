@@ -14,9 +14,9 @@ function safeApply(board, side, mv) {
 function counts(board) {
   let ns = 0, nk = 0;
   for (let x = 0; x < 4; x++) for (let y = 0; y < 4; y++) {
-    if (board[x][y] === 'stone') ns++; else if (board[x][y] === 'stick') nk++;
+    if (board[x][y] === 'black') ns++; else if (board[x][y] === 'red') nk++;
   }
-  return { stone: ns, stick: nk };
+  return { black: ns, red: nk };
 }
 function mobility(board, side) { return Rules.legalMoves(board, side).length; }
 function centerCount(board, side) {
@@ -71,8 +71,8 @@ function negamax(board, side, depth, alpha, beta, ncm, prevPass, ply, evalFn) {
   if (moves.length === 0) {
     if (prevPass) {
       const c = counts(board);
-      if (c.stone === c.stick) return 0;
-      const w = c.stone > c.stick ? 'stone' : 'stick';
+      if (c.black === c.red) return 0;
+      const w = c.black > c.red ? 'black' : 'red';
       return w === side ? WIN - ply : -WIN + ply;
     }
     return -negamax(board, Rules.other(side), depth - 1, -beta, -alpha, ncm + 1, true, ply + 1, evalFn);
@@ -125,13 +125,13 @@ function makeBot(name, evalFn) {
 function makeTemplates(w) {
   const evalMaterial = (board, side, ncm) => {
     const c = counts(board); const opp = Rules.other(side);
-    const diff = (side === 'stone' ? c.stone - c.stick : c.stick - c.stone);
+    const diff = (side === 'black' ? c.black - c.red : c.red - c.black);
     return 1000 * diff + 4 * (mobility(board, side) - mobility(board, opp))
       + 6 * (centerCount(board, side) - centerCount(board, opp));
   };
   const evalBlockade = (board, side, ncm) => {
     const c = counts(board); const opp = Rules.other(side);
-    const diff = (side === 'stone' ? c.stone - c.stick : c.stick - c.stone);
+    const diff = (side === 'black' ? c.black - c.red : c.red - c.black);
     const myMob = mobility(board, side), opMob = mobility(board, opp);
     let s = 500 * diff + w.blockMob * (myMob - opMob);
     if (opMob === 0) s += 250;
@@ -140,7 +140,7 @@ function makeTemplates(w) {
   };
   const evalRuling = (board, side, ncm) => {
     const c = counts(board); const opp = Rules.other(side);
-    const diff = (side === 'stone' ? c.stone - c.stick : c.stick - c.stone);
+    const diff = (side === 'black' ? c.black - c.red : c.red - c.black);
     let s = 1000 * diff + 8 * cohesion(board, side)
       + 3 * (mobility(board, side) - mobility(board, opp))
       - w.rulDef * threats(board, opp);
@@ -149,7 +149,7 @@ function makeTemplates(w) {
   };
   const evalCenter = (board, side, ncm) => {
     const c = counts(board); const opp = Rules.other(side);
-    const diff = (side === 'stone' ? c.stone - c.stick : c.stick - c.stone);
+    const diff = (side === 'black' ? c.black - c.red : c.red - c.black);
     return (w.cenMat || 800) * diff
       + w.cenThreat * threats(board, side)
       - (w.cenOppThreat || w.cenThreat) * threats(board, opp)  // 非对称威胁规避(结构项)

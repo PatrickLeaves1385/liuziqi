@@ -1,5 +1,5 @@
 'use strict';
-// 发布烟雾测试（§6.2）：三名训练棋手各执石/木各 1 局，共 6 局，固定种子集。
+// 发布烟雾测试（§6.2）：三名训练棋手各执黑、执红各 1 局，共 6 局，固定种子集。
 // 任何一局以 illegal/runtime/error 终局 → 发布失败。
 const { playMatch } = require('./engine_quota');
 const { getTrainingBot } = require('./training_bots');
@@ -9,12 +9,12 @@ const BUDGET = 100;
 
 // 固定种子集（§6.2：与版本无关，同代码重复发布结果一致）
 const SMOKE_PLAN = [
-  { trainerId: 'moutong', trainerName: '牧童', userSide: 'stone', seed: 10101 },
-  { trainerId: 'moutong', trainerName: '牧童', userSide: 'stick', seed: 10102 },
-  { trainerId: 'shilang', trainerName: '石郎', userSide: 'stone', seed: 20201 },
-  { trainerId: 'shilang', trainerName: '石郎', userSide: 'stick', seed: 20202 },
-  { trainerId: 'qisheng', trainerName: '棋圣', userSide: 'stone', seed: 30301 },
-  { trainerId: 'qisheng', trainerName: '棋圣', userSide: 'stick', seed: 30302 },
+  { trainerId: 'moutong', trainerName: '牧童', userSide: 'black', seed: 10101 },
+  { trainerId: 'moutong', trainerName: '牧童', userSide: 'red', seed: 10102 },
+  { trainerId: 'shilang', trainerName: '石郎', userSide: 'black', seed: 20201 },
+  { trainerId: 'shilang', trainerName: '石郎', userSide: 'red', seed: 20202 },
+  { trainerId: 'qisheng', trainerName: '棋圣', userSide: 'black', seed: 30301 },
+  { trainerId: 'qisheng', trainerName: '棋圣', userSide: 'red', seed: 30302 },
 ];
 
 const FAIL_REASONS = new Set(['illegal', 'runtime', 'error']);
@@ -37,9 +37,9 @@ function runSmokeTests(code) {
 
   for (const plan of SMOKE_PLAN) {
     const trainer = getTrainingBot(plan.trainerId);
-    const bots = plan.userSide === 'stone'
-      ? { stone: userBot, stick: trainer }
-      : { stone: trainer, stick: userBot };
+    const bots = plan.userSide === 'black'
+      ? { black: userBot, red: trainer }
+      : { black: trainer, red: userBot };
 
     const result = playMatch(bots, plan.seed, BUDGET);
 

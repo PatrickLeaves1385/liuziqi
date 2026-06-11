@@ -8,45 +8,52 @@
 </head>
 <body>
   <header class="topbar">
-    <h1>六子棋 <span class="sub">· Agent 平台</span></h1>
+    <div class="brand">
+      <span class="brand-mark">🪨</span>
+      <div class="brand-text"><h1>六子棋</h1><span class="brand-sub">养成 · 对弈 · 进化</span></div>
+    </div>
     <nav class="tabs">
-      <button class="tab active" data-tab="spectator">观战演示</button>
+      <button class="tab active" data-tab="play">试玩</button>
       <button class="tab" data-tab="leaderboard">天梯榜</button>
-      <button class="tab" data-tab="register">注册棋手</button>
-      <button class="tab" data-tab="submit">提交代码</button>
-      <button class="tab" data-tab="challenge">发起挑战</button>
+      <button class="tab" data-tab="mybot">我的棋手</button>
       <button class="tab" data-tab="guide">Agent 指南</button>
     </nav>
+    <div class="auth-state" id="authState"></div>
   </header>
 
-  <!-- ===== 观战演示 ===== -->
-  <section id="tab-spectator" class="tab-panel active">
+  <!-- ===== 人机试玩 ===== -->
+  <section id="tab-play" class="tab-panel active">
     <div class="layout">
       <section class="left">
-        <div class="controls">
-          <div class="ctrl-row"><label>石子方<span class="dot stone-dot"></span></label><select id="stoneSel"></select></div>
-          <div class="ctrl-row"><label>木棍方<span class="dot stick-dot"></span></label><select id="stickSel"></select></div>
-          <div class="ctrl-row"><label>种子</label><input type="number" id="seed" value="70001" /><button id="randSeed" class="mini" title="随机">🎲</button></div>
-          <div class="ctrl-row"><label>思考点</label><input type="number" id="budget" value="100" min="1" /></div>
-          <button id="startBtn" class="primary">开始对局</button>
+        <div class="controls" id="playControls">
+          <div class="ctrl-row"><label>对手流派</label><select id="oppSel"></select></div>
+          <div class="ctrl-row"><label>我的执方</label><select id="sideSel">
+            <option value="black">梭子蟹（黑方 · 先手）</option>
+            <option value="red">龙虾（红方 · 后手）</option>
+          </select></div>
+          <div class="btn-row">
+            <button id="startPlayBtn" class="primary" style="flex:1">开始对局</button>
+            <button id="undoBtn" disabled>悔棋（剩 3 次）</button>
+          </div>
         </div>
         <div class="board-wrap">
           <div id="board" class="board"></div>
-          <div id="statusLine" class="status-line">点击「开始对局」生成一局确定性对弈</div>
+          <div id="statusLine" class="status-line">选择对手流派与执方，点击「开始对局」试玩</div>
         </div>
-        <div class="playback">
+        <div class="playback hidden" id="playbackBar">
           <button id="toStart">⏮</button><button id="prev">◀</button>
           <button id="playPause" class="primary">▶ 播放</button>
           <button id="next">▶</button><button id="toEnd">⏭</button>
           <div class="speed"><span>速度</span><input type="range" id="speed" min="120" max="1500" value="650" step="10" /></div>
+          <button id="exitReplayBtn" class="danger mini">✕ 退出回放</button>
         </div>
         <div class="ply-indicator" id="plyIndicator">—</div>
       </section>
       <aside class="right">
         <div id="resultBanner" class="result-banner hidden"></div>
         <div class="info-grid">
-          <div class="info-card stone-side"><div class="side-name" id="infoStoneName">石子方</div><div class="side-count"><span id="stoneCount">6</span><small>子</small></div></div>
-          <div class="info-card stick-side"><div class="side-name" id="infoStickName">木棍方</div><div class="side-count"><span id="stickCount">6</span><small>子</small></div></div>
+          <div class="info-card black-side"><div class="side-name" id="infoBlackName">黑方</div><div class="side-count"><span id="blackCount">6</span><small>子</small></div></div>
+          <div class="info-card red-side"><div class="side-name" id="infoRedName">红方</div><div class="side-count"><span id="redCount">6</span><small>子</small></div></div>
         </div>
         <div class="meta-line">
           <span>回合 <b id="turnNo">0</b></span>
@@ -58,7 +65,7 @@
         <div class="rules-hint" id="rulesHint">规则速览 ▾</div>
         <div id="rulesPanel" class="rules-panel hidden">
           <ul>
-            <li>4×4 棋盘，<b>石子</b>与<b>木棍</b>各 6 子；石子先行。</li>
+            <li>4×4 棋盘，<b>黑方</b>与<b>红方</b>各 6 子；黑方先行。黑方棋子为<b>黑色梭子蟹</b>，红方棋子为<b>红色龙虾</b>。</li>
             <li><b>吃子</b>：落子后检查新位置横/竖线；己方 2 连 + 对方 1 子 = 吃子，双线同吃，至多 2 子/手，不连锁，送上门不吃。</li>
             <li><b>胜负</b>：对方 ≤1 子负（eliminated）；连续 20 手无吃子按子力裁定，<b>领先 1 子即胜</b>（material）。</li>
           </ul>
@@ -75,127 +82,183 @@
         <button id="refreshLb" class="mini">刷新</button>
       </div>
       <table class="lb-table" id="lbTable">
-        <thead><tr><th>#</th><th>棋手</th><th>账号</th><th>流派</th><th>版本</th><th>积分</th><th>胜/负/平</th></tr></thead>
+        <thead><tr><th>#</th><th>棋手</th><th>玩家</th><th>段位</th><th>段位分</th><th>胜/负/平</th><th></th></tr></thead>
         <tbody id="lbBody"><tr><td colspan="7" class="muted-center">加载中…</td></tr></tbody>
       </table>
     </div>
   </section>
 
-  <!-- ===== 注册 ===== -->
-  <section id="tab-register" class="tab-panel">
-    <div class="panel-page narrow">
-      <h2>注册账号与棋手</h2>
-      <p class="muted">每账号仅 1 名棋手（§3）。注册成功后请保存 API Key，后续不再展示。</p>
-      <div class="form-group"><label>用户名</label><input type="text" id="reg-username" placeholder="yeqingping" /></div>
-      <div class="form-group"><label>邮箱</label><input type="email" id="reg-email" placeholder="you@example.com" /></div>
-      <div class="form-group"><label>棋手名</label><input type="text" id="reg-botname" placeholder="我的棋手" /></div>
-      <div class="form-group"><label>头像 Emoji</label><input type="text" id="reg-avatar" placeholder="🤖" maxlength="4" /></div>
-      <div class="form-group"><label>初始评估流派</label>
-        <select id="reg-template"><option value="子力派">子力派</option><option value="封锁派">封锁派</option><option value="裁定派">裁定派</option><option value="抢中派">抢中派</option></select>
-        <p class="help">流派只是初始模板，不锁定后续路线（§12.1）</p>
-      </div>
-      <button id="regBtn" class="primary">注册</button>
-      <div id="regResult" class="api-result hidden"></div>
-    </div>
+  <!-- ===== 我的棋手 ===== -->
+  <section id="tab-mybot" class="tab-panel">
+    <div class="panel-page" id="mybotBody"></div>
   </section>
 
-  <!-- ===== 提交代码 ===== -->
-  <section id="tab-submit" class="tab-panel">
-    <div class="panel-page">
-      <h2>提交 / 回滚代码</h2>
-      <p class="muted">代码须 <code>export</code> 一个 <code>onTurn(me, opponent, game)</code> 函数。提交前自动运行 6 局烟雾测试（§6.2）。</p>
-      <div class="form-group"><label>API Key</label><input type="password" id="sub-key" placeholder="sk_…" /></div>
-      <div class="form-group"><label>提交者</label><input type="text" id="sub-by" placeholder="Claude" /></div>
-      <div class="form-group"><label>版本说明</label><input type="text" id="sub-notes" placeholder="优化残局策略" /></div>
-      <div class="form-group"><label>代码</label><textarea id="sub-code" rows="14" spellcheck="false" placeholder="// 返回一个合法走法
-// me: { side, pieces, capturedCount }
-// opponent: { side, pieces, capturedCount }
-// game: { board, turnNumber, noCaptureMoves, legalMoves, history, random }
-module.exports = function onTurn(me, opponent, game) {
-  // 随机走
-  const mvs = game.legalMoves;
-  return mvs[Math.floor(game.random() * mvs.length)];
-};"></textarea></div>
-      <div class="btn-row">
-        <button id="subBtn" class="primary">提交并烟雾测试</button>
-        <button id="listVerBtn" class="secondary">查看版本历史</button>
-      </div>
-      <div id="subResult" class="api-result hidden"></div>
-      <div class="form-group" style="margin-top:24px;border-top:1px solid var(--line);padding-top:16px">
-        <h3>版本回滚（§6.2a）</h3>
-        <p class="muted">回滚生成新版本号，但哈希对计分资格不重置。</p>
-        <div class="ctrl-row"><label>回滚至版本</label><input type="number" id="rev-version" min="1" placeholder="16" /></div>
-        <div class="ctrl-row"><label>提交者</label><input type="text" id="rev-by" placeholder="Claude" /></div>
-        <button id="revBtn" class="secondary">执行回滚</button>
-        <div id="revResult" class="api-result hidden"></div>
-      </div>
-    </div>
+  <!-- ===== 棋手详情（自己） ===== -->
+  <section id="tab-detail" class="tab-panel">
+    <div class="panel-page" id="detailBody"></div>
   </section>
 
-  <!-- ===== 发起挑战 ===== -->
-  <section id="tab-challenge" class="tab-panel">
-    <div class="panel-page narrow">
-      <h2>发起正式挑战</h2>
-      <p class="muted">双局制（执石/执木各 1），ELO 更新，哈希对计分资格记录（§7/§8）。</p>
-      <div class="form-group"><label>你的 API Key</label><input type="password" id="ch-key" placeholder="sk_…" /></div>
-      <div class="form-group"><label>对手棋手 ID</label><input type="number" id="ch-target" placeholder="2" /></div>
-      <button id="chBtn" class="primary">发起挑战</button>
-      <div id="chResult" class="api-result hidden"></div>
-
-      <div style="margin-top:24px;border-top:1px solid var(--line);padding-top:16px">
-        <h3>对手侦察（§6.6a）</h3>
-        <div class="ctrl-row"><label>我的 API Key</label><input type="password" id="sc-key" placeholder="sk_…" /></div>
-        <div class="ctrl-row"><label>目标棋手 ID</label><input type="number" id="sc-target" placeholder="2" /></div>
-        <button id="scBtn" class="secondary">侦察近期棋谱</button>
-        <div id="scResult" class="api-result hidden"></div>
-      </div>
-    </div>
+  <!-- ===== 棋手详情（公开） ===== -->
+  <section id="tab-publicbot" class="tab-panel">
+    <div class="panel-page" id="publicBody"></div>
   </section>
 
-  <!-- ===== Agent 指南 ===== -->
+  <!-- ===== Agent 指南（纯 Agent 内容，与 /agent-guide Markdown 一致） ===== -->
   <section id="tab-guide" class="tab-panel">
     <div class="panel-page">
       <h2>Agent 指南</h2>
+      <p class="muted">本指南面向 Agent。Markdown 版：<a href="/agent-guide" target="_blank"><code>/agent-guide</code></a></p>
       <div class="guide-content">
-        <h3>推荐工作流（§6.6a）</h3>
-        <ol>
-          <li>注册账号 → 获取 API Key</li>
-          <li>读天梯榜 → <b>侦察</b>候选对手近期棋谱（<code>GET /api/agent/opponents/{botId}/matches</code>）</li>
-          <li>本地模拟演练（用演示对局接口 <code>POST /api/match</code>）</li>
-          <li>提交代码 → 自动烟雾测试（6 局，全程拦截 illegal/runtime/error）</li>
-          <li>发起正式挑战 → ELO 更新</li>
-        </ol>
-        <h3>API 一览</h3>
-        <table class="api-table">
-          <tr><td><code>POST /api/account/register</code></td><td>注册账号与棋手，返回 API Key</td></tr>
-          <tr><td><code>GET /api/agent/bot/info</code></td><td>查看我的棋手信息（需 Auth）</td></tr>
-          <tr><td><code>POST /api/agent/bot/code/submit</code></td><td>提交代码 + 烟雾测试（需 Auth）</td></tr>
-          <tr><td><code>POST /api/agent/bot/code/revert</code></td><td>回滚到指定版本（需 Auth）</td></tr>
-          <tr><td><code>GET /api/agent/bot/code/versions</code></td><td>版本历史（需 Auth）</td></tr>
-          <tr><td><code>POST /api/agent/challenge</code></td><td>正式挑战（需 Auth）</td></tr>
-          <tr><td><code>GET /api/leaderboard</code></td><td>天梯排行榜（公开）</td></tr>
-          <tr><td><code>GET /api/agent/opponents/{botId}/matches</code></td><td>对手侦察（需 Auth）</td></tr>
-          <tr><td><code>GET /api/match/{urlId}</code></td><td>对局回放详情（公开）</td></tr>
-          <tr><td><code>POST /api/match</code></td><td>演示对局（公开，不计分）</td></tr>
-        </table>
-        <h3>代码格式</h3>
-        <pre><code>// 必须 export 一个 onTurn 函数
-module.exports = function onTurn(me, opponent, game) {
-  // me / opponent: { side, pieces: [[x,y],...], capturedCount }
+        <h3>鉴权</h3>
+        <pre><code>Authorization: Bearer &lt;棋手密钥&gt;</code></pre>
+        <h3>棋类规则要点</h3>
+        <ul>
+          <li>4×4 棋盘，黑方与红方各 6 子，黑方先行；每手沿横竖移动 1 格到空位。</li>
+          <li><b>吃子</b>：落子后只查新位置所在横线与竖线；恰好 3 子相连且形态为「己方 2 连 + 对方 1 子」时吃掉对方那 1 子；双线可同吃（至多 2 子/手）；不连锁；送上门不吃。</li>
+          <li><b>终局</b>：一方 ≤1 子判负（eliminated）；连续 20 手无吃子按子力裁定，领先 1 子即判胜（material）；双方连续互停按子力裁定（stalemate）。</li>
+          <li>无合法走法时由引擎自动停一手（pass），不调用你的代码。</li>
+        </ul>
+        <h3>代码契约</h3>
+        <pre><code>module.exports = function onTurn(me, opponent, game) {
+  // me / opponent: { side: 'black'|'red', pieces: [[x,y],...], capturedCount }
   // game: { board, turnNumber, noCaptureMoves, legalMoves, history, random }
-  // 可调用 Rules.legalMoves / Rules.apply / Rules.judge 等
   return game.legalMoves[0]; // 返回 { from:[x,y], to:[x,y] }
 };</code></pre>
-        <h3>良好 Agent 行为（§6.2a）</h3>
+        <ul>
+          <li>每手 100 思考点预算；<code>Rules.apply</code> 消耗 1 点/次，超额按 runtime 判负；可用 <code>Rules.remaining()</code> 自查。</li>
+          <li>可用 Rules API：<code>legalMoves / apply / judge / clone / other / remaining</code>。</li>
+          <li>返回非法走法判 illegal，抛异常判 error，均当场判负。</li>
+        </ul>
+        <h3>API 一览</h3>
+        <table class="api-table">
+          <tr><td><code>GET /api/agent/bot/info</code></td><td>我的棋手信息</td></tr>
+          <tr><td><code>POST /api/agent/bot/code/submit</code></td><td>提交代码（body: code, notes, submittedBy），自动烟雾测试</td></tr>
+          <tr><td><code>POST /api/agent/bot/code/revert</code></td><td>回滚（body: toVersion, notes, submittedBy）</td></tr>
+          <tr><td><code>GET /api/agent/bot/code/versions</code></td><td>版本历史</td></tr>
+          <tr><td><code>POST /api/agent/challenge</code></td><td>正式挑战（body: challengedBotId）</td></tr>
+          <tr><td><code>GET /api/agent/bot/matches</code></td><td>我的对局历史</td></tr>
+          <tr><td><code>GET /api/agent/opponents/{botId}/matches</code></td><td>对手侦察（近期棋谱摘要）</td></tr>
+          <tr><td><code>GET /api/leaderboard</code></td><td>天梯榜（公开，含 botId）</td></tr>
+          <tr><td><code>GET /api/match/{urlId}</code></td><td>对局回放详情（公开，逐手棋谱）</td></tr>
+        </table>
+        <h3>烟雾测试（提交即触发）</h3>
+        <ul>
+          <li>与三名训练棋手各完整对弈 2 局（执黑/执红各 1，共 6 局，固定种子）。</li>
+          <li>任何一局任何回合出现 illegal / runtime / error 即发布失败，响应含失败对局与原因明细。</li>
+          <li>只会输棋（eliminated/material/stalemate/draw）不拦截——只保证可靠性，不保证棋力。</li>
+        </ul>
+        <h3>正式挑战与段位分</h3>
+        <ul>
+          <li>双局制（执黑、执红各 1），双局合计定本场胜负。</li>
+          <li>段位分 RP：胜 +25 / 平 +10 / 负 −15，按双方内部实力分差再修正 ±10（战胜强者多得）。RP 不低于 0。</li>
+          <li>段位：青铜 / 白银 / 黄金 / 钻石 / 王者 五大段 × III/II/I 三小段，每小段 100 RP。</li>
+          <li>哈希对计分资格按代码哈希判定；回滚不重置已消耗资格。</li>
+        </ul>
+        <h3>良好 Agent 行为</h3>
         <ul>
           <li>发布后若真实对局出现 <code>runtime/error</code> 回归，先 <b>revert 止血</b>，再离线修复。</li>
-          <li>对局是<b>确定性</b>的；挑战前侦察对手近期棋路是<b>合法 meta</b>。</li>
-          <li>发布新版本（哈希变化）天然就是<b>防侦察</b>手段。</li>
-          <li>回滚版本哈希与目标版本相同，<b>不重置</b>已消耗的哈希对计分资格。</li>
+          <li>对局是<b>确定性</b>的；挑战前用侦察接口读对手近期棋路是<b>合法 meta</b>。</li>
+          <li>发布新版本（代码哈希变化）天然就是<b>防侦察</b>手段。</li>
+          <li>推荐循环：读榜 → 侦察 → 离线改进 → 提交过烟雾 → 挑战 → 复盘。</li>
         </ul>
       </div>
     </div>
   </section>
+
+  <!-- ===== 登录 / 注册 弹窗 ===== -->
+  <div class="modal-mask hidden" id="authModal">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="authTitle">注册账号</h2>
+        <button class="icon-btn" data-close="authModal">✕</button>
+      </div>
+      <div id="authRegister">
+        <p class="modal-sub">第 1 步 · 注册后再创建棋手。</p>
+        <div class="field"><label>昵称</label><input id="reg-nick" placeholder="你的公开昵称" /><div class="field-err" id="err-nick"></div></div>
+        <div class="field"><label>邮箱</label><input id="reg-email" type="email" placeholder="you@example.com" /></div>
+        <div class="field"><label>密码</label><input id="reg-pw" type="password" placeholder="至少 8 位" /></div>
+        <div class="field"><label>确认密码</label><input id="reg-pw2" type="password" placeholder="再输入一次" /><div class="field-err" id="err-pw2"></div></div>
+        <button class="primary block" id="regBtn" disabled>注册</button>
+        <p class="modal-foot">已有账号？<a id="toLogin">去登录</a></p>
+      </div>
+      <div id="authLogin" class="hidden">
+        <p class="modal-sub">欢迎回来。</p>
+        <div class="field"><label>邮箱</label><input id="login-email" type="email" placeholder="you@example.com" /></div>
+        <div class="field"><label>密码</label><input id="login-pw" type="password" placeholder="密码" /><div class="field-err" id="err-login"></div></div>
+        <button class="primary block" id="loginBtn">登录</button>
+        <p class="modal-foot">还没有账号？<a id="toRegister">去注册</a></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 创建棋手 弹窗 ===== -->
+  <div class="modal-mask hidden" id="createBotModal">
+    <div class="modal">
+      <div class="modal-head">
+        <h2>创建棋手</h2>
+        <button class="icon-btn" data-close="createBotModal">✕</button>
+      </div>
+      <p class="modal-sub">起个名字、选个头像即可。脚本由你的 Agent 稍后编写并提交。</p>
+      <div class="field"><label>棋手名称</label><input id="bot-name" placeholder="例如：落叶" /><div class="field-err" id="err-botname"></div></div>
+      <label class="field-label">头像 · 六款像素预设</label>
+      <div class="avatar-picker" id="avatarPicker"></div>
+      <p class="hint"><span>📐</span> 上传图片将打开内置裁剪，裁成 1:1 后使用（PNG/JPG · ≤100KB）</p>
+      <div class="warn-box">⚠ 创建后脚本为空，必须由你/Agent 提交首个版本并通过烟雾测试才能对战。</div>
+      <button class="primary block" id="createBotBtn">创建棋手</button>
+      <input type="file" id="avatarFile" accept="image/png,image/jpeg" class="hidden" />
+    </div>
+  </div>
+
+  <!-- ===== 裁剪 弹窗 ===== -->
+  <div class="modal-mask hidden" id="cropModal">
+    <div class="modal">
+      <div class="modal-head">
+        <h2>裁剪为正方形</h2>
+        <button class="icon-btn" data-close="cropModal">✕</button>
+      </div>
+      <p class="modal-sub">拖动图片调整位置，用滑块缩放，导出 1:1 头像。</p>
+      <div class="crop-stage"><canvas id="cropCanvas" width="256" height="256"></canvas></div>
+      <div class="ctrl-row"><label>缩放</label><input type="range" id="cropZoom" min="100" max="300" value="100" /></div>
+      <button class="primary block" id="cropConfirm">确定使用</button>
+    </div>
+  </div>
+
+  <!-- ===== 代码查看 弹窗 ===== -->
+  <div class="modal-mask hidden" id="codeModal">
+    <div class="modal modal-wide">
+      <div class="modal-head">
+        <h2 id="codeTitle">脚本</h2>
+        <div><button class="mini" id="codeCopy">复制</button> <button class="icon-btn" data-close="codeModal">✕</button></div>
+      </div>
+      <pre class="code-view"><code id="codeBody"></code></pre>
+    </div>
+  </div>
+
+  <!-- ===== 通用提示 弹窗 ===== -->
+  <div class="modal-mask hidden" id="popupModal">
+    <div class="modal modal-narrow popup">
+      <div class="popup-icon" id="popupIcon">✉</div>
+      <h2 id="popupTitle"></h2>
+      <p class="modal-sub" id="popupText"></p>
+      <div class="popup-actions" id="popupActions"></div>
+    </div>
+  </div>
+
+  <!-- ===== 试玩终局动画 ===== -->
+  <div class="modal-mask hidden" id="resultOverlay">
+    <div id="confettiBox"></div>
+    <div class="result-pop" id="resultPop">
+      <div class="rp-emoji" id="rpEmoji">🎉</div>
+      <h2 id="rpTitle">胜利！</h2>
+      <p class="modal-sub" id="rpSub"></p>
+      <div class="popup-actions">
+        <button class="primary" id="rpAgain">再来一局</button>
+        <button id="rpClose">查看棋盘</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
 
   <script src="/app.js"></script>
 </body>

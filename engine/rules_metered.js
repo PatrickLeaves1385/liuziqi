@@ -9,7 +9,7 @@ function _reset(budget) { _pts = budget; }
 function remaining() { return _pts; }
 
 function clone(board) { return board.map((col) => col.slice()); }
-function other(side) { return side === 'stone' ? 'stick' : 'stone'; }
+function other(side) { return side === 'black' ? 'red' : 'black'; }
 
 function legalMoves(board, side) {
   const mv = [];
@@ -75,19 +75,19 @@ function apply(board, side, move) {
 function counts(board) {
   let s = 0, k = 0;
   for (let x = 0; x < 4; x++) for (let y = 0; y < 4; y++) {
-    if (board[x][y] === 'stone') s++; else if (board[x][y] === 'stick') k++;
+    if (board[x][y] === 'black') s++; else if (board[x][y] === 'red') k++;
   }
-  return { stone: s, stick: k };
+  return { black: s, red: k };
 }
 
 // 终局裁定(规则 v2.1 §6):≤1 子判负;连续 20 手无吃子按子力裁定(领先 1 子即判胜,维持现行规则)
 function judge(board, ncm) {
   const c = counts(board);
-  if (c.stone <= 1) return { winner: 'stick', reason: 'eliminated' };
-  if (c.stick <= 1) return { winner: 'stone', reason: 'eliminated' };
+  if (c.black <= 1) return { winner: 'red', reason: 'eliminated' };
+  if (c.red <= 1) return { winner: 'black', reason: 'eliminated' };
   if (ncm >= 20) {
-    if (c.stone === c.stick) return { winner: 'draw', reason: 'draw' };
-    return { winner: c.stone > c.stick ? 'stone' : 'stick', reason: 'material' };
+    if (c.black === c.red) return { winner: 'draw', reason: 'draw' };
+    return { winner: c.black > c.red ? 'black' : 'red', reason: 'material' };
   }
   return null;
 }

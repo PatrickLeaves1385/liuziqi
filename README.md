@@ -16,7 +16,7 @@ node server.js
 
 ## 玩法
 
-- 选择**石子方**与**木棍方**的流派（子力派 / 封锁派 / 裁定派 / 抢中派），设定**种子**与**思考点**，点「开始对局」。
+- 选择**黑方**与**红方**的流派（子力派 / 封锁派 / 裁定派 / 抢中派），设定**种子**与**思考点**，点「开始对局」。
 - 对局是**确定性的**：同流派 + 同种子 + 同思考点 → 结果完全一致。
 - 播放控制：⏮ 回开局 / ◀ 上一手 / ▶ 播放暂停 / ▶ 下一手 / ⏭ 跳终局；方向键←→单步、空格播放/暂停。
 - 右侧显示双方子数、当前回合、无吃子手数（/20）、棋谱（可点击跳手）与终局裁定。
@@ -27,7 +27,7 @@ node server.js
 server.js            # 零依赖 HTTP 服务器：静态资源 + /api/templates + /api/match
 engine/              # 自包含引擎（从 GameDesign 复制，未改动）
   rules_metered.js   #   规则 + 吃子结算 + 终局裁定（带思考点计量）
-  engine_quota.js    #   对局主循环（石子先行 / 自动停手 / 判负）
+  engine_quota.js    #   对局主循环（黑方先行 / 自动停手 / 判负）
   templates_factory.js #  四套评估流派 + negamax 搜索
 public/              # 前端
   index.html  style.css  app.js
@@ -37,14 +37,14 @@ GameDesign/          # 原始策划与规则代码（参考，未纳入运行）
 ## API
 
 - `GET /api/templates` → `{ templates:[{name,summary}], weights }`
-- `POST /api/match`，body `{ stone, stick, seed, budget }`
+- `POST /api/match`，body `{ black, red, seed, budget }`
   → `{ ok, winner, reason, turns, finalPieces, initialBoard, history, elapsedMs }`
-  - `winner`: `stone` | `stick` | `draw`
+  - `winner`: `black` | `red` | `draw`
   - `reason`: `eliminated`（吃至≤1子）/ `material`（20手裁定）/ `stalemate`（互停裁定）/ `draw` / `illegal` / `runtime` / `error`
 
 ## 规则要点
 
-4×4 棋盘，石子与木棍各 6 子，石子先行，每手沿横竖走一步到相邻空格。
+4×4 棋盘，黑子与红子各 6 子，黑方先行，每手沿横竖走一步到相邻空格。
 走棋方形成「2 连己方 + 1 对方」的相连三子即吃掉对方那子（仅结算落子的横线与竖线，双线同吃，单手至多 2 子，不连锁，送上门不吃）。
 对方 ≤1 子判负；连续 20 手无吃子按子力裁定，**领先 1 子即判胜**。
 

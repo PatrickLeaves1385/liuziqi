@@ -28,8 +28,8 @@ function roundRobin(bots, seedBase) {
   for (let i = 0; i < bots.length; i++) {
     for (let j = i + 1; j < bots.length; j++) {
       for (let g = 1; g <= GAMES_PER_PAIR; g++) {
-        const p1Stone = g <= GAMES_PER_PAIR / 2;
-        const m = p1Stone ? { stone: bots[i], stick: bots[j] } : { stone: bots[j], stick: bots[i] };
+        const p1Black = g <= GAMES_PER_PAIR / 2;
+        const m = p1Black ? { black: bots[i], red: bots[j] } : { black: bots[j], red: bots[i] };
         const r = playMatch(m, seedFor(seedBase, pairIdx, g), BUDGET);
         const winnerName = r.winner === 'draw' ? null : m[r.winner].name;
         const sig = r.history.map((h) => (h.pass ? 'P' : `${h.from}${h.to}${h.captured.length}`)).join('|');

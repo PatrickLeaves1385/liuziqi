@@ -1,6 +1,6 @@
 'use strict';
 // 对局引擎(按规则 v2.1 §4 与策划案 §7.1 重建)
-// - 石子先行;每手前重置走棋方思考点为 budget
+// - 黑方先行;每手前重置走棋方思考点为 budget
 // - 无合法走法由引擎自动 pass(计入 noCaptureMoves),连续互停 → stalemate 按子力裁定
 // - illegal / error / runtime(超点)立即判负
 const { Rules } = require('./rules_metered');
@@ -16,8 +16,8 @@ function mulberry32(a) {
 
 function initBoard() {
   const b = Array.from({ length: 4 }, () => Array(4).fill(null));
-  for (const [x, y] of [[0, 3], [1, 3], [2, 3], [3, 3], [0, 2], [3, 2]]) b[x][y] = 'stone';
-  for (const [x, y] of [[0, 0], [1, 0], [2, 0], [3, 0], [0, 1], [3, 1]]) b[x][y] = 'stick';
+  for (const [x, y] of [[0, 3], [1, 3], [2, 3], [3, 3], [0, 2], [3, 2]]) b[x][y] = 'black';
+  for (const [x, y] of [[0, 0], [1, 0], [2, 0], [3, 0], [0, 1], [3, 1]]) b[x][y] = 'red';
   return b;
 }
 
@@ -27,11 +27,11 @@ function piecesOf(board, side) {
   return p;
 }
 
-// bots = { stone: bot, stick: bot }
+// bots = { black: bot, red: bot }
 function playMatch(bots, seed, budget) {
   const rnd = mulberry32(seed);
   let board = initBoard();
-  let side = 'stone', turn = 1, ncm = 0, lastPass = false;
+  let side = 'black', turn = 1, ncm = 0, lastPass = false;
   const history = [];
 
   const fin = (winner, reason) => ({
@@ -46,8 +46,8 @@ function playMatch(bots, seed, budget) {
       ncm++;
       if (lastPass) { // 双方连续互停 → 按子力裁定(规则四.5)
         const c = Rules._counts(board);
-        if (c.stone === c.stick) return fin('draw', 'draw');
-        return fin(c.stone > c.stick ? 'stone' : 'stick', 'stalemate');
+        if (c.black === c.red) return fin('draw', 'draw');
+        return fin(c.black > c.red ? 'black' : 'red', 'stalemate');
       }
       lastPass = true;
       const v = Rules.judge(board, ncm); // pass 计入 20 手计数

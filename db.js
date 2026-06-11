@@ -10,20 +10,22 @@ PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS accounts (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  username   TEXT    UNIQUE NOT NULL,
-  email      TEXT    UNIQUE NOT NULL,
-  created_at INTEGER NOT NULL
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  nickname      TEXT    UNIQUE NOT NULL,
+  email         TEXT    UNIQUE NOT NULL,
+  password_hash TEXT    NOT NULL,
+  created_at    INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS bots (
   id                   INTEGER PRIMARY KEY AUTOINCREMENT,
   account_id           INTEGER UNIQUE NOT NULL,
   name                 TEXT    NOT NULL,
-  avatar               TEXT    NOT NULL DEFAULT '🤖',
-  template_name        TEXT    NOT NULL,
+  avatar               TEXT    NOT NULL DEFAULT 'preset:1',  -- 'preset:1..6' 或 'upload:<botId>'
+  template_name        TEXT,                                 -- 可空：建棋手不再选流派
   current_version      INTEGER NOT NULL DEFAULT 0,
-  rating               INTEGER NOT NULL DEFAULT 1200,
+  rating               INTEGER NOT NULL DEFAULT 1200,        -- ELO 内部实力分（不对外展示）
+  rp                   INTEGER NOT NULL DEFAULT 0,           -- 段位分（对外展示，决定段位）
   wins INTEGER NOT NULL DEFAULT 0,
   losses INTEGER NOT NULL DEFAULT 0,
   draws INTEGER NOT NULL DEFAULT 0,
@@ -37,6 +39,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
   bot_id     INTEGER NOT NULL,
   key_hash   TEXT    NOT NULL,
   key_prefix TEXT    NOT NULL,
+  key_plain  TEXT    NOT NULL,   -- 明文留存：详情页掩码展示 + 组装 Prompt 需完整 key（demo 取舍）
   created_at INTEGER NOT NULL,
   FOREIGN KEY (bot_id) REFERENCES bots(id)
 );
@@ -101,20 +104,28 @@ function urlId() { return crypto.randomBytes(8).toString('hex'); }
 function now() { return Date.now(); }
 
 // ---- 账号 ----
-const stmtInsertAccount = db.prepare('INSERT INTO accounts(username,email,created_at) VALUES(?,?,?)');
+const stmtInsertAccount = db.prepare('INSERT INTO accounts(nickname,email,password_hash,created_at) VALUES(?,?,?,?)');
 const stmtGetAccountByEmail = db.prepare('SELECT * FROM accounts WHERE email=?');
-const stmtGetAccountByUsername = db.prepare('SELECT * FROM accounts WHERE username=?');
+const stmtGetAccountByNickname = db.prepare('SELECT * FROM accounts WHERE nickname=?');
+const stmtGetAccountById = db.prepare('SELECT * FROM accounts WHERE id=?');
 
 // ---- 棋手 ----
-const stmtInsertBot = db.prepare('INSERT INTO bots(account_id,name,avatar,template_name,created_at) VALUES(?,?,?,?,?)');
+const stmtInsertBot = db.prepare('INSERT INTO bots(account_id,name,avatar,created_at) VALUES(?,?,?,?)');
 const stmtGetBotById = db.prepare('SELECT * FROM bots WHERE id=?');
 const stmtGetBotByAccount = db.prepare('SELECT * FROM bots WHERE account_id=?');
 const stmtUpdateBotVersion = db.prepare('UPDATE bots SET current_version=? WHERE id=?');
-const stmtUpdateBotRating = db.prepare('UPDATE bots SET rating=?,wins=wins+?,losses=losses+?,draws=draws+? WHERE id=?');
-const stmtListBots = db.prepare('SELECT b.*,a.username FROM bots b JOIN accounts a ON b.account_id=a.id ORDER BY b.rating DESC LIMIT 100');
+const stmtUpdateBotAvatar = db.prepare('UPDATE bots SET avatar=? WHERE id=?');
+const stmtUpdateBotRating = db.prepare('UPDATE bots SET rating=?,rp=?,wins=wins+?,losses=losses+?,draws=draws+? WHERE id=?');
+const stmtListBots = db.prepare('SELECT b.*,a.nickname FROM bots b JOIN accounts a ON b.account_id=a.id ORDER BY b.rp DESC, b.rating DESC LIMIT 100');
+// 当前排名：RP 高者在前，同 RP 比 ELO
+const stmtBotRankPos = db.prepare(`
+  SELECT COUNT(*)+1 AS pos FROM bots b, (SELECT rp, rating FROM bots WHERE id=?) me
+  WHERE b.rp > me.rp OR (b.rp = me.rp AND b.rating > me.rating)`);
 
 // ---- API Key ----
-const stmtInsertKey = db.prepare('INSERT INTO api_keys(bot_id,key_hash,key_prefix,created_at) VALUES(?,?,?,?)');
+const stmtInsertKey = db.prepare('INSERT INTO api_keys(bot_id,key_hash,key_prefix,key_plain,created_at) VALUES(?,?,?,?,?)');
+const stmtDeleteKeysForBot = db.prepare('DELETE FROM api_keys WHERE bot_id=?');
+const stmtGetKeyByBot = db.prepare('SELECT key_plain,key_prefix FROM api_keys WHERE bot_id=? ORDER BY id DESC LIMIT 1');
 const stmtGetBotByKey = db.prepare(`
   SELECT b.* FROM bots b
   JOIN api_keys k ON k.bot_id=b.id
@@ -174,28 +185,36 @@ module.exports = {
   hashKey, codeHash, generateKey, urlId, now,
 
   // 账号
-  createAccount(username, email) {
-    stmtInsertAccount.run(username, email, now());
+  createAccount(nickname, email, passwordHash) {
+    stmtInsertAccount.run(nickname, email, passwordHash, now());
     return stmtGetAccountByEmail.get(email);
   },
   getAccountByEmail: (email) => stmtGetAccountByEmail.get(email),
-  getAccountByUsername: (username) => stmtGetAccountByUsername.get(username),
+  getAccountByNickname: (nickname) => stmtGetAccountByNickname.get(nickname),
+  getAccountById: (id) => stmtGetAccountById.get(id),
 
   // 棋手
-  createBot(accountId, name, avatar, templateName) {
-    stmtInsertBot.run(accountId, name, avatar, templateName, now());
+  createBot(accountId, name, avatar) {
+    stmtInsertBot.run(accountId, name, avatar || 'preset:1', now());
     return stmtGetBotByAccount.get(accountId);
   },
   getBotById: (id) => stmtGetBotById.get(id),
   getBotByAccount: (accountId) => stmtGetBotByAccount.get(accountId),
+  updateBotAvatar: (botId, avatar) => stmtUpdateBotAvatar.run(avatar, botId),
   listBots: () => stmtListBots.all(),
 
   // API Key
   createApiKey(botId) {
     const key = generateKey();
-    stmtInsertKey.run(botId, hashKey(key), key.slice(0, 8), now());
+    stmtInsertKey.run(botId, hashKey(key), key.slice(0, 8), key, now());
     return key;
   },
+  // 轮换：删旧 key、发新 key
+  rotateApiKey(botId) {
+    stmtDeleteKeysForBot.run(botId);
+    return this.createApiKey(botId);
+  },
+  getBotKeyInfo: (botId) => stmtGetKeyByBot.get(botId),
   getBotByApiKey: (key) => stmtGetBotByKey.get(hashKey(key)),
 
   // 代码版本
@@ -228,9 +247,10 @@ module.exports = {
   // 评分
   recordHashPair(botId, myHash, oppHash) { stmtUpsertHashPair.run(botId, myHash, oppHash); },
   getHashPair: (botId, myHash, oppHash) => stmtGetHashPair.get(botId, myHash, oppHash),
-  updateRating(botId, newRating, wins, losses, draws) {
-    stmtUpdateBotRating.run(newRating, wins, losses, draws, botId);
+  updateRating(botId, newRating, newRp, wins, losses, draws) {
+    stmtUpdateBotRating.run(newRating, newRp, wins, losses, draws, botId);
   },
+  getBotRankPosition(botId) { const r = stmtBotRankPos.get(botId); return r ? r.pos : null; },
   eloUpdate,
 
   db, // 供直接查询

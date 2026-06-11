@@ -33,10 +33,10 @@ function makeTwoply(_rnd) {
   function material(board, side) {
     let s = 0, k = 0;
     for (let x = 0; x < 4; x++) for (let y = 0; y < 4; y++) {
-      if (board[x][y] === 'stone') s++;
-      else if (board[x][y] === 'stick') k++;
+      if (board[x][y] === 'black') s++;
+      else if (board[x][y] === 'red') k++;
     }
-    return side === 'stone' ? s - k : k - s;
+    return side === 'black' ? s - k : k - s;
   }
   function score1(board, side, ncm) {
     const v = Rules.judge(board, ncm);
