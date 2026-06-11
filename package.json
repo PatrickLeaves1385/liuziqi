@@ -1,0 +1,13 @@
+{
+  "name": "sixchess-spectator",
+  "version": "0.1.0",
+  "description": "六子棋 AI 对战观战 · Node 全栈 Demo（零依赖）",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test:rules": "node GameDesign/test_rules.js"
+  },
+  "engines": { "node": ">=16" },
+  "license": "UNLICENSED"
+}

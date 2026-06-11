@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>六子棋 · AI 对战观战</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>六子棋 <span class="sub">· AI 对战观战</span></h1>
+    <div class="ruleshint" id="rulesHint" title="点击展开规则">规则速览 ▾</div>
+  </header>
+
+  <div id="rulesPanel" class="rules-panel hidden">
+    <ul>
+      <li>4×4 棋盘，<b>石子</b>与<b>木棍</b>各 6 子；石子先行，每手沿横竖方向走一步到相邻空格。</li>
+      <li><b>吃子</b>：仅结算落子所在的横线与竖线；走棋方形成「2 连己方 + 1 对方」的相连三子即吃掉对方那子（双线同吃，单手至多 2 子，不连锁，送上门不吃）。</li>
+      <li><b>胜负</b>：对方 ≤1 子判负（eliminated）；连续 20 手无吃子按子力裁定，<b>领先 1 子即判胜</b>（material）；无路可走自动停手，双方互停按子力裁定（stalemate）。</li>
+    </ul>
+  </div>
+
+  <main class="layout">
+    <!-- 左：控制 + 棋盘 -->
+    <section class="left">
+      <div class="controls">
+        <div class="ctrl-row">
+          <label>石子方<span class="dot stone-dot"></span></label>
+          <select id="stoneSel"></select>
+        </div>
+        <div class="ctrl-row">
+          <label>木棍方<span class="dot stick-dot"></span></label>
+          <select id="stickSel"></select>
+        </div>
+        <div class="ctrl-row">
+          <label>种子</label>
+          <input type="number" id="seed" value="70001" />
+          <button id="randSeed" class="mini" title="随机种子">🎲</button>
+        </div>
+        <div class="ctrl-row">
+          <label>思考点</label>
+          <input type="number" id="budget" value="100" min="1" />
+        </div>
+        <button id="startBtn" class="primary">开始对局</button>
+      </div>
+
+      <div class="board-wrap">
+        <div id="board" class="board"></div>
+        <div id="statusLine" class="status-line">点击「开始对局」生成一局确定性对弈</div>
+      </div>
+
+      <div class="playback">
+        <button id="toStart" title="回到开局">⏮</button>
+        <button id="prev" title="上一手">◀</button>
+        <button id="playPause" class="primary" title="播放/暂停">▶ 播放</button>
+        <button id="next" title="下一手">▶</button>
+        <button id="toEnd" title="跳到终局">⏭</button>
+        <div class="speed">
+          <span>速度</span>
+          <input type="range" id="speed" min="120" max="1500" value="650" step="10" />
+        </div>
+      </div>
+      <div class="ply-indicator" id="plyIndicator">—</div>
+    </section>
+
+    <!-- 右：信息 + 棋谱 -->
+    <aside class="right">
+      <div id="resultBanner" class="result-banner hidden"></div>
+
+      <div class="info-grid">
+        <div class="info-card stone-side">
+          <div class="side-name" id="infoStoneName">石子方</div>
+          <div class="side-count"><span id="stoneCount">6</span><small>子</small></div>
+        </div>
+        <div class="info-card stick-side">
+          <div class="side-name" id="infoStickName">木棍方</div>
+          <div class="side-count"><span id="stickCount">6</span><small>子</small></div>
+        </div>
+      </div>
+
+      <div class="meta-line">
+        <span>回合 <b id="turnNo">0</b></span>
+        <span>行棋 <b id="toMove">—</b></span>
+        <span>无吃子 <b id="ncm">0</b>/20</span>
+      </div>
+
+      <h3 class="movelist-title">棋谱</h3>
+      <ol id="moveList" class="move-list"></ol>
+    </aside>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
