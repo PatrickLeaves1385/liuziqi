@@ -146,8 +146,9 @@ function renderAuthState() {
     el.innerHTML = `<span class="who">${avatarBadge()}${esc(ME.account.nickname)}</span><button class="mini" id="logoutBtn">登出</button>`;
     $('logoutBtn').addEventListener('click', async () => { await apiFetch('POST', '/api/auth/logout'); await refreshMe(); showTab('play'); toast('已登出'); });
   } else {
-    el.innerHTML = `<button class="primary mini" id="openAuthBtn">登录 / 注册</button>`;
-    $('openAuthBtn').addEventListener('click', () => openAuth('register'));
+    el.innerHTML = `<button class="primary mini" id="openRegisterBtn">注册</button><button class="mini" id="openLoginBtn">登录</button>`;
+    $('openRegisterBtn').addEventListener('click', () => openAuth('register'));
+    $('openLoginBtn').addEventListener('click', () => openAuth('login'));
   }
 }
 function avatarBadge() {
@@ -236,7 +237,7 @@ function renderMyBot() {
       <div class="av">${avatarHtml(b.avatar)}</div>
       <div class="grow">
         <h2>${esc(b.name)} ${empty ? '<span class="chip empty">空脚本</span>' : '<span class="chip active">可对战</span>'} <span class="chip ver">v${b.currentVersion}</span></h2>
-        <div class="stat-row"><span>${rankLabel(b.rp)} · 段位分 ${b.rp || 0}</span></div>
+        <div class="stat-row"><span>${rankLabel(b.rp)} · 段位分 ${b.rp || 0} · 天梯排名 ${b.rankPosition ? '#' + b.rankPosition : '—'}</span></div>
         ${empty ? '<div class="warn-box" style="margin-top:10px">脚本为空，棋手尚不能对战 —— 进入详情，复制 Prompt 交给 Agent 提交首个版本。</div>' : ''}
       </div>
       <div class="actions"><button class="primary" id="goDetail">详情</button></div>
@@ -549,10 +550,9 @@ async function loadLeaderboard() {
 $('refreshLb').addEventListener('click', loadLeaderboard);
 
 // ============================================================
-// 棋盘渲染（试玩 + 回放共用）
+// 棋盘渲染（试玩棋盘；正式对局回放在独立弹窗，见文末）
 // ============================================================
-let boardMode = 'play'; // 'play' | 'replay'
-let state = { match: null, frames: [], cur: 0, timer: null, playing: false };
+let state = { match: null, frames: [], cur: 0 };
 
 function cloneBoard(b) { return b.map((col) => col.slice()); }
 function countOf(b) { let black=0,red=0; for(let x=0;x<4;x++) for(let y=0;y<4;y++){if(b[x][y]==='black')black++;else if(b[x][y]==='red')red++;} return{black,red}; }
@@ -576,10 +576,10 @@ function buildBoardCells(){
     board.appendChild(cell);
   }
 }
-function cellAt(x,y){return document.querySelector(`.cell[data-x="${x}"][data-y="${y}"]`);}
+function cellAt(x,y){return document.querySelector(`#board .cell[data-x="${x}"][data-y="${y}"]`);}
 function renderFrame(){
   const f=state.frames[state.cur];if(!f)return;
-  document.querySelectorAll('.cell').forEach((c)=>{c.classList.remove('lastfrom','lastto','captured','sel','hint','clickable');c.innerHTML='';});
+  document.querySelectorAll('#board .cell').forEach((c)=>{c.classList.remove('lastfrom','lastto','captured','sel','hint','clickable');c.innerHTML='';});
   for(let x=0;x<4;x++)for(let y=0;y<4;y++){
     const v=f.board[x][y];if(!v)continue;
     const t=document.createElement('div');t.className='token '+v;t.innerHTML=tokenSvg(v);
@@ -603,67 +603,49 @@ function renderFrame(){
   }
   document.querySelector('.black-side').classList.toggle('active',tm==='black');
   document.querySelector('.red-side').classList.toggle('active',tm==='red');
-  document.querySelectorAll('.move-list li').forEach((li,i)=>li.classList.toggle('cur',i===state.cur-1));
-  document.querySelector('.move-list li.cur')?.scrollIntoView({block:'nearest'});
+  document.querySelectorAll('#moveList li').forEach((li,i)=>li.classList.toggle('cur',i===state.cur-1));
+  document.querySelector('#moveList li.cur')?.scrollIntoView({block:'nearest'});
   updateStatusLine();
   $('plyIndicator').textContent=state.frames.length>1?`第 ${state.cur} / ${state.frames.length-1} 手`:'—';
-  if(boardMode==='play')paintPlayHints();
+  paintPlayHints();
 }
 function nextSideToMove(){
-  if(boardMode==='play'&&play.started&&!play.over)return play.toMove;
+  if(play.started&&!play.over)return play.toMove;
   if(state.cur>=state.frames.length-1)return null;
   const next=state.frames[state.cur+1];
   return next&&next.move?next.move.side:null;
 }
 function updateStatusLine(){
   const banner=$('resultBanner');
-  if(boardMode==='play'){
-    if(!play.started){banner.className='result-banner hidden';$('statusLine').textContent='选择对手流派与执方，点击「开始对局」试玩';return;}
-    if(play.over){
-      const m=state.match;
-      const who=m.winner==='draw'?'和棋':`${SIDE_LABEL[m.winner]}（${m.winner==='black'?m.blackName:m.redName}）胜`;
-      const youWon=m.winner===play.humanSide;
-      banner.className='result-banner '+(m.winner==='draw'?'':(youWon?'win':''));
-      banner.innerHTML=`${m.winner==='draw'?'和棋':(youWon?'🎉 你赢了！':'你输了')}<small>${REASON_LABEL[m.reason]||m.reason} · 共 ${m.turns} 手</small>`;
-      $('statusLine').textContent=`终局：${who}`;
-      return;
-    }
-    banner.className='result-banner hidden';
-    $('statusLine').textContent=play.sel?'点击高亮格完成走子，或点其他己方棋子换选':'轮到你走子：点击你的棋子';
+  if(!play.started){banner.className='result-banner hidden';$('statusLine').textContent='选择对手与执方，点击「开始对局」试玩';return;}
+  if(play.over){
+    const m=state.match;
+    const who=m.winner==='draw'?'和棋':`${SIDE_LABEL[m.winner]}（${m.winner==='black'?m.blackName:m.redName}）胜`;
+    const youWon=m.winner===play.humanSide;
+    banner.className='result-banner '+(m.winner==='draw'?'':(youWon?'win':''));
+    banner.innerHTML=`${m.winner==='draw'?'和棋':(youWon?'🎉 你赢了！':'你输了')}<small>${REASON_LABEL[m.reason]||m.reason} · 共 ${m.turns} 手</small>`;
+    $('statusLine').textContent=`终局：${who}`;
     return;
   }
-  // 回放模式
-  const atEnd=state.cur===state.frames.length-1;
-  if(atEnd&&state.match){
-    const m=state.match;
-    const who=m.winner==='draw'?'和棋':`${SIDE_LABEL[m.winner]||m.winner}（${m.winner==='black'?m.blackName:m.redName}）胜`;
-    banner.className='result-banner '+(m.winner==='draw'?'':'win');
-    banner.innerHTML=`${who}<small>${REASON_LABEL[m.reason]||m.reason} · 共 ${m.turns} 手</small>`;
-    $('statusLine').textContent=`终局：${who}`;
-  }else{
-    banner.className='result-banner hidden';
-    const mv=state.frames[state.cur].move;
-    $('statusLine').textContent=mv?(mv.pass?`${SIDE_LABEL[mv.side]} 停一手`:`${SIDE_LABEL[mv.side]} (${mv.from})→(${mv.to})${mv.captured.length?` 吃${mv.captured.length}子`:''}`):'开局布局';
-  }
+  banner.className='result-banner hidden';
+  $('statusLine').textContent=play.sel?'点击高亮格完成走子，或点其他己方棋子换选':'轮到你走子：点击你的棋子';
 }
 function renderMoveList(){
   const ol=$('moveList');ol.innerHTML='';
   if(!state.match||!state.match.history)return;
   state.match.history.forEach((h,i)=>{
     const li=document.createElement('li');
-    const icon=`<span class="mv-side">${tokenSvg(h.side)}</span>`;
-    if(h.pass)li.innerHTML=`<span class="mv-no">${i+1}</span>${icon}<span class="mv-pass">停一手</span>`;
-    else{const cap=h.captured.length?`<span class="mv-cap">吃${h.captured.length}</span>`:'';li.innerHTML=`<span class="mv-no">${i+1}</span>${icon}<span>(${h.from})→(${h.to})</span>${cap}`;}
-    if(boardMode==='replay')li.addEventListener('click',()=>{pause();goTo(i+1);});
+    li.innerHTML=moveLiHtml(h,i);
     ol.appendChild(li);
   });
 }
-function goTo(i){state.cur=Math.max(0,Math.min(state.frames.length-1,i));renderFrame();}
-function step(d){goTo(state.cur+d);}
-function play_(){if(state.cur>=state.frames.length-1)state.cur=0;state.playing=true;$('playPause').textContent='⏸ 暂停';tickReplay();}
-function tickReplay(){clearTimeout(state.timer);if(!state.playing)return;if(state.cur>=state.frames.length-1){pause();return;}step(1);state.timer=setTimeout(tickReplay,+$('speed').value);}
-function pause(){state.playing=false;clearTimeout(state.timer);$('playPause').textContent='▶ 播放';}
-function togglePlay(){state.playing?pause():play_();}
+// 棋谱行 HTML（试玩 / 回放共用）
+function moveLiHtml(h,i){
+  const icon=`<span class="mv-side">${tokenSvg(h.side)}</span>`;
+  if(h.pass)return `<span class="mv-no">${i+1}</span>${icon}<span class="mv-pass">停一手</span>`;
+  const cap=h.captured.length?`<span class="mv-cap">吃${h.captured.length}</span>`:'';
+  return `<span class="mv-no">${i+1}</span>${icon}<span>(${h.from})→(${h.to})</span>${cap}`;
+}
 
 // ============================================================
 // 人机试玩
@@ -751,8 +733,6 @@ async function postPlay(history,{animate}={}){
   return r;
 }
 async function startPlay(){
-  boardMode='play';
-  $('playbackBar').classList.add('hidden');
   play.started=true;play.over=false;play.template=$('oppSel').value;play.humanSide=$('sideSel').value;
   play.history=[];play.legal=[];play.sel=null;play.undosLeft=3;play.busy=false;play.resultShown=false;
   state.match=null;state.frames=[];state.cur=0;
@@ -761,7 +741,7 @@ async function startPlay(){
   toast(`对局开始：你执${play.humanSide==='black'?'梭子蟹（黑方 · 先手）':'龙虾（红方 · 后手）'}，对手「${play.template}」`);
 }
 function onCellClick(x,y){
-  if(boardMode!=='play'||!play.started||play.over||play.busy)return;
+  if(!play.started||play.over||play.busy)return;
   // 点击合法目标 → 走子
   if(play.sel){
     const mv=play.legal.find((m)=>m.from[0]===play.sel[0]&&m.from[1]===play.sel[1]&&m.to[0]===x&&m.to[1]===y);
@@ -793,51 +773,122 @@ $('startPlayBtn').addEventListener('click',startPlay);
 $('undoBtn').addEventListener('click',undoMove);
 
 // ============================================================
-// 对局回放（正式对局）
+// 对局回放（正式对局 · 独立弹窗，与试玩棋盘完全隔离）
 // ============================================================
+const rstate = { match: null, frames: [], cur: 0, timer: null, playing: false };
+
+function rCellAt(x,y){return document.querySelector(`#rBoard .cell[data-x="${x}"][data-y="${y}"]`);}
+function buildReplayCells(){
+  const board=$('rBoard');board.innerHTML='';
+  for(let y=3;y>=0;y--)for(let x=0;x<4;x++){
+    const cell=document.createElement('div');
+    cell.className='cell'+((x+y)%2?' alt':'');
+    cell.dataset.x=x;cell.dataset.y=y;
+    board.appendChild(cell);
+  }
+}
+function rRenderFrame(){
+  const f=rstate.frames[rstate.cur];if(!f)return;
+  document.querySelectorAll('#rBoard .cell').forEach((c)=>{c.classList.remove('lastfrom','lastto','captured');c.innerHTML='';});
+  for(let x=0;x<4;x++)for(let y=0;y<4;y++){
+    const v=f.board[x][y];if(!v)continue;
+    const t=document.createElement('div');t.className='token '+v;t.innerHTML=tokenSvg(v);
+    rCellAt(x,y).appendChild(t);
+  }
+  const mv=f.move;
+  if(mv&&!mv.pass){
+    rCellAt(mv.from[0],mv.from[1])?.classList.add('lastfrom');
+    rCellAt(mv.to[0],mv.to[1])?.classList.add('lastto');
+    for(const[cx,cy]of mv.captured)rCellAt(cx,cy)?.classList.add('captured');
+  }
+  $('rBlackCount').textContent=f.counts.black;
+  $('rRedCount').textContent=f.counts.red;
+  $('rTurnNo').textContent=f.turn;
+  $('rNcm').textContent=f.ncm;
+  const next=rstate.cur<rstate.frames.length-1?rstate.frames[rstate.cur+1]:null;
+  const tm=next&&next.move?next.move.side:null;
+  $('rToMove').textContent=tm?SIDE_LABEL[tm]:'—';
+  document.querySelector('#replayModal .black-side').classList.toggle('active',tm==='black');
+  document.querySelector('#replayModal .red-side').classList.toggle('active',tm==='red');
+  document.querySelectorAll('#rMoveList li').forEach((li,i)=>li.classList.toggle('cur',i===rstate.cur-1));
+  document.querySelector('#rMoveList li.cur')?.scrollIntoView({block:'nearest'});
+  // 终局横幅：播到最后一手时展示
+  const m=rstate.match,banner=$('rResultBanner');
+  if(m&&rstate.cur===rstate.frames.length-1){
+    const who=m.winnerSide==='draw'?'和棋':`${esc(m.winnerSide==='black'?m.blackName:m.redName)}（${SIDE_LABEL[m.winnerSide]}）胜`;
+    banner.className='result-banner '+(m.winnerSide==='draw'?'':'win');
+    banner.innerHTML=`${who}<small>${REASON_LABEL[m.reason]||m.reason} · 共 ${m.turns} 手</small>`;
+  }else banner.className='result-banner hidden';
+  $('rPlyIndicator').textContent=rstate.frames.length>1?`第 ${rstate.cur} / ${rstate.frames.length-1} 手`:'—';
+}
+function rGoTo(i){rstate.cur=Math.max(0,Math.min(rstate.frames.length-1,i));rRenderFrame();}
+function rStep(d){rGoTo(rstate.cur+d);}
+function rPause(){rstate.playing=false;clearTimeout(rstate.timer);$('rPlayPause').textContent='▶ 播放';}
+function rTick(){clearTimeout(rstate.timer);if(!rstate.playing)return;if(rstate.cur>=rstate.frames.length-1){rPause();return;}rStep(1);rstate.timer=setTimeout(rTick,+$('rSpeed').value);}
+function rPlay(){if(rstate.cur>=rstate.frames.length-1)rstate.cur=0;rstate.playing=true;$('rPlayPause').textContent='⏸ 暂停';rTick();}
+function rTogglePlay(){rstate.playing?rPause():rPlay();}
+function rRenderMoveList(){
+  const ol=$('rMoveList');ol.innerHTML='';
+  rstate.match.history.forEach((h,i)=>{
+    const li=document.createElement('li');
+    li.innerHTML=moveLiHtml(h,i);
+    li.addEventListener('click',()=>{rPause();rGoTo(i+1);});
+    ol.appendChild(li);
+  });
+}
 async function replaySavedMatch(urlId) {
   const r = await apiFetch('GET', '/api/match/' + urlId);
   if (!r.ok) return toast(r.error || '加载失败');
-  boardMode='replay';play.started=false;play.over=false;
-  $('playbackBar').classList.remove('hidden');
-  state.match = { blackName: r.challengerName, redName: r.challengedName, winner: r.winner, reason: r.reason, turns: r.turns, history: r.gameData.history };
-  state.frames = buildFrames(r.gameData.initialBoard, r.gameData.history);
-  state.cur = 0; showTab('play'); renderMoveList(); renderFrame();
-  updateUndoBtn();
-  toast('已载入对局回放');
+  // 挑战双方执方由 challenger_side 决定（第 2 局挑战者执红）
+  const chSide = r.challenger_side === 'red' ? 'red' : 'black';
+  const cdSide = chSide === 'black' ? 'red' : 'black';
+  const names = { [chSide]: r.challengerName, [cdSide]: r.challengedName };
+  const winnerSide = r.winner === 'draw' ? 'draw' : (r.winner === 'challenger' ? chSide : cdSide);
+  rstate.match = { blackName: names.black, redName: names.red, winnerSide, reason: r.reason, turns: r.turns, history: r.gameData.history };
+  rstate.frames = buildFrames(r.gameData.initialBoard, r.gameData.history);
+  rstate.cur = 0; rPause();
+  $('replayTitle').textContent = `对局回放 · ${names.black} vs ${names.red}`;
+  $('rBlackName').innerHTML = `${miniIcon('black')} ${esc(names.black || '黑方')}`;
+  $('rRedName').innerHTML = `${miniIcon('red')} ${esc(names.red || '红方')}`;
+  rRenderMoveList(); rRenderFrame();
+  openModal('replayModal');
 }
-function exitReplay(){
-  pause();boardMode='play';
-  $('playbackBar').classList.add('hidden');
-  play.started=false;play.over=false;play.history=[];play.legal=[];play.sel=null;
-  state.match=null;state.frames=buildFrames(initialBoard(),[]);state.cur=0;
-  renderMoveList();renderFrame();updateUndoBtn();
-}
-$('exitReplayBtn').addEventListener('click',exitReplay);
+$('rPlayPause').addEventListener('click',rTogglePlay);
+$('rNext').addEventListener('click',()=>{rPause();rStep(1);});
+$('rPrev').addEventListener('click',()=>{rPause();rStep(-1);});
+$('rToStart').addEventListener('click',()=>{rPause();rGoTo(0);});
+$('rToEnd').addEventListener('click',()=>{rPause();rGoTo(rstate.frames.length-1);});
+// 关闭弹窗（✕ 或点遮罩）时停止自动播放
+$('replayModal').addEventListener('click',(e)=>{
+  if(e.target===$('replayModal')||e.target.dataset.close==='replayModal')rPause();
+});
+document.addEventListener('keydown',(e)=>{
+  if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT'||e.target.tagName==='TEXTAREA')return;
+  if($('replayModal').classList.contains('hidden'))return;
+  if(e.key==='ArrowRight'){rPause();rStep(1);}
+  else if(e.key==='ArrowLeft'){rPause();rStep(-1);}
+  else if(e.key===' '){e.preventDefault();rTogglePlay();}
+  else if(e.key==='Escape'){rPause();closeModal('replayModal');}
+});
+
+$('rulesHint').addEventListener('click',()=>$('rulesPanel').classList.toggle('hidden'));
 
 async function loadTemplates(){
   const data=await apiFetch('GET','/api/templates');
-  $('oppSel').innerHTML=data.templates.map((t)=>`<option value="${t.name}" title="${esc(t.summary)}">${t.name} — ${esc(t.summary)}</option>`).join('');
+  const opt=(t)=>`<option value="${esc(t.name)}" title="${esc(t.summary)}">${esc(t.name)} — ${esc(t.summary)}</option>`;
+  const tpl=data.templates.filter((t)=>t.kind!=='training');
+  const train=data.templates.filter((t)=>t.kind==='training');
+  $('oppSel').innerHTML=
+    `<optgroup label="评估流派">${tpl.map(opt).join('')}</optgroup>`+
+    (train.length?`<optgroup label="训练棋手">${train.map(opt).join('')}</optgroup>`:'');
 }
-$('playPause').addEventListener('click',togglePlay);
-$('next').addEventListener('click',()=>{pause();step(1);});
-$('prev').addEventListener('click',()=>{pause();step(-1);});
-$('toStart').addEventListener('click',()=>{pause();goTo(0);});
-$('toEnd').addEventListener('click',()=>{pause();goTo(state.frames.length-1);});
-$('rulesHint').addEventListener('click',()=>$('rulesPanel').classList.toggle('hidden'));
-document.addEventListener('keydown',(e)=>{
-  if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT'||e.target.tagName==='TEXTAREA')return;
-  if(boardMode!=='replay'||!$('tab-play').classList.contains('active'))return;
-  if(e.key==='ArrowRight'){pause();step(1);}
-  else if(e.key==='ArrowLeft'){pause();step(-1);}
-  else if(e.key===' '){e.preventDefault();togglePlay();}
-});
 
 // ============================================================
 // 初始化
 // ============================================================
 (async function init(){
   buildBoardCells();
+  buildReplayCells();
   state.frames=buildFrames(initialBoard(),[]);
   state.cur=0;renderFrame();
   await refreshMe();

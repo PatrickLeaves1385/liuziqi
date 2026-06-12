@@ -1,5 +1,5 @@
 'use strict';
-// 六子棋 Agent 平台 · Node 全栈服务器 v2.0
+// 钳王争霸 Agent 平台 · Node 全栈服务器 v2.0
 // 零第三方依赖，使用 Node 内置 http / fs / path / crypto / vm / node:sqlite
 const http = require('http');
 const fs = require('fs');
@@ -9,6 +9,7 @@ const { playMatch, initBoard } = require('./engine/engine_quota');
 const { Rules } = require('./engine/rules_metered');
 const { makeTemplates } = require('./engine/templates_factory');
 const { makeBot } = require('./engine/sandbox');
+const { TRAINING_BOTS } = require('./engine/training_bots');
 const { runSmokeTests } = require('./engine/smoke');
 const db = require('./db');
 const auth = require('./auth');
@@ -22,12 +23,25 @@ fs.mkdirSync(AVATAR_DIR, { recursive: true });
 // 定稿基线权重（§14.4 sweep 复跑报告）
 const WEIGHTS = { blockMob: 60, rulDef: 8, cenThreat: 15, cenCenter: 50, cenHunt: 4, cenMat: 1000 };
 const TEMPLATE_META = [
-  { name: '子力派', summary: '以子力差为主，辅以机动与中心；直接吃子换子。' },
-  { name: '封锁派', summary: '压制对方机动数，把对手逼到无路可走。' },
-  { name: '裁定派', summary: '棋子凝聚 + 规避被吃；领先时拖到 20 手按子力判胜。' },
-  { name: '抢中派', summary: '抢中心 + 威胁导向；领先时持续吃子打 eliminated。' },
+  { name: '子力派', summary: '以子力差为主，辅以机动与中心；直接吃子换子。', kind: 'template' },
+  { name: '封锁派', summary: '压制对方机动数，把对手逼到无路可走。', kind: 'template' },
+  { name: '裁定派', summary: '棋子凝聚 + 规避被吃；领先时拖到 20 手按子力判胜。', kind: 'template' },
+  { name: '抢中派', summary: '抢中心 + 威胁导向；领先时持续吃子打 eliminated。', kind: 'template' },
 ];
-const TEMPLATE_NAMES = TEMPLATE_META.map((t) => t.name);
+// 三名训练棋手也开放试玩（烟雾测试同款）
+const TRAINING_META = [
+  { name: '牧童', summary: '随机走子，熟悉规则的入门对手。', kind: 'training' },
+  { name: '石郎', summary: '有吃必吃，其余随机。', kind: 'training' },
+  { name: '棋圣', summary: '两层子力搜索，稳健难缠。', kind: 'training' },
+];
+const OPPONENT_META = [...TEMPLATE_META, ...TRAINING_META];
+const OPPONENT_NAMES = OPPONENT_META.map((t) => t.name);
+function findPlayOpponent(name) {
+  const t = makeTemplates(WEIGHTS).find((b) => b.name === name);
+  if (t) return t;
+  const def = TRAINING_BOTS.find((d) => d.make().name === name);
+  return def ? def.make() : null;
+}
 
 function piecesOf(board, side) {
   const p = [];
@@ -164,7 +178,7 @@ async function dispatch(req, res) {
 // § 试玩流派列表
 // ============================================================
 route('GET', '/api/templates', (req, res) => {
-  sendJson(res, 200, { templates: TEMPLATE_META });
+  sendJson(res, 200, { templates: OPPONENT_META });
 });
 
 // ============================================================
@@ -185,12 +199,12 @@ function mulberry32(a) {
 }
 route('POST', '/api/play', (req, res, _m, body) => {
   const { template, humanSide } = body;
-  if (!TEMPLATE_NAMES.includes(template)) return sendJson(res, 400, { ok: false, error: '流派非法' });
+  if (!OPPONENT_NAMES.includes(template)) return sendJson(res, 400, { ok: false, error: '对手非法' });
   if (humanSide !== 'black' && humanSide !== 'red') return sendJson(res, 400, { ok: false, error: 'humanSide 须为 black/red' });
   const rawHistory = Array.isArray(body.history) ? body.history : [];
   if (rawHistory.length > 2000) return sendJson(res, 400, { ok: false, error: '历史过长' });
   const botSide = Rules.other(humanSide);
-  const bot = makeTemplates(WEIGHTS).find((b) => b.name === template);
+  const bot = findPlayOpponent(template);
 
   // ---- 重放校验（吃子/pass 由服务端重算，不信任客户端附带字段）----
   let board = initBoard();
@@ -324,7 +338,7 @@ route('GET', '/api/me', (req, res) => {
     ok: true,
     account: { id: account.id, nickname: account.nickname, email: account.email },
     hasBot: !!bot,
-    bot: bot ? { id: bot.id, name: bot.name, avatar: bot.avatar, rp: bot.rp, currentVersion: bot.current_version } : null,
+    bot: bot ? { id: bot.id, name: bot.name, avatar: bot.avatar, rp: bot.rp, rankPosition: db.getBotRankPosition(bot.id), currentVersion: bot.current_version } : null,
   });
 });
 
@@ -423,7 +437,7 @@ route('GET', '/api/bot/me/prompt', (req, res) => {
   const key = keyInfo ? keyInfo.key_plain : '';
   const origin = `http://${req.headers.host || 'localhost:' + PORT}`;
   const prompt = [
-    '你是我的六子棋 Agent。请为我的棋手编写并提交对弈脚本。',
+    '你是我的钳王争霸 Agent。请为我的棋手编写并提交对弈脚本。',
     '',
     `【棋手】${bot.name}（botId: ${bot.id}） · 段位：${rankLabel(bot.rp)} · 当前版本：v${bot.current_version}${bot.current_version === 0 ? '（空脚本）' : ''}`,
     `【棋手密钥】${key}     ← 鉴权用，请勿外泄`,
@@ -780,9 +794,11 @@ route('GET', /^\/api\/bots\/(\d+)\/matches\/public$/, (req, res, m) => {
 // ============================================================
 // § Agent 指南（Markdown 纯文本，供 Agent 直接抓取阅读）
 // ============================================================
-const AGENT_GUIDE_MD = `# 六子棋 Agent 指南
+const AGENT_GUIDE_MD = `# 钳王争霸 Agent 指南
 
-你是一名六子棋棋手的 Agent。通过本平台 API 为棋手编写、测试、提交对弈脚本，并发起正式挑战提升段位。
+你是一名钳王争霸棋手的 Agent。通过本平台 API 为棋手编写、测试、提交对弈脚本，并发起正式挑战提升段位。
+
+注意：钳王争霸是「夹吃」类吃子棋，与连珠 / 五子棋 / Connect6 等「连成一线获胜」的玩法**完全无关**，请勿按连子规则理解。
 
 ## 鉴权
 
@@ -858,6 +874,6 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`六子棋 Agent 平台已启动: http://localhost:${PORT}`);
+  console.log(`钳王争霸 Agent 平台已启动: http://localhost:${PORT}`);
   console.log('API: /api/account/register | /api/agent/bot/code/submit | /api/agent/challenge | /api/leaderboard');
 });

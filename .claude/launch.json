@@ -5,6 +5,7 @@
       "name": "sixchess",
       "runtimeExecutable": "C:\\Program Files\\nodejs\\node.exe",
       "runtimeArgs": ["server.js"],
+      "env": { "SESSION_SECRET": "dev-fixed-secret-for-local-preview" },
       "port": 3000,
       "autoPort": true
     }

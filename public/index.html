@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>六子棋 · Agent 平台</title>
+  <title>钳王争霸 · Agent 平台</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
-      <span class="brand-mark">🪨</span>
-      <div class="brand-text"><h1>六子棋</h1><span class="brand-sub">养成 · 对弈 · 进化</span></div>
+      <span class="brand-mark">🦀</span>
+      <div class="brand-text"><h1>钳王争霸</h1><span class="brand-sub">养成 · 对弈 · 进化</span></div>
     </div>
     <nav class="tabs">
       <button class="tab active" data-tab="play">试玩</button>
@@ -26,7 +26,7 @@
     <div class="layout">
       <section class="left">
         <div class="controls" id="playControls">
-          <div class="ctrl-row"><label>对手流派</label><select id="oppSel"></select></div>
+          <div class="ctrl-row"><label>对手</label><select id="oppSel"></select></div>
           <div class="ctrl-row"><label>我的执方</label><select id="sideSel">
             <option value="black">梭子蟹（黑方 · 先手）</option>
             <option value="red">龙虾（红方 · 后手）</option>
@@ -38,14 +38,7 @@
         </div>
         <div class="board-wrap">
           <div id="board" class="board"></div>
-          <div id="statusLine" class="status-line">选择对手流派与执方，点击「开始对局」试玩</div>
-        </div>
-        <div class="playback hidden" id="playbackBar">
-          <button id="toStart">⏮</button><button id="prev">◀</button>
-          <button id="playPause" class="primary">▶ 播放</button>
-          <button id="next">▶</button><button id="toEnd">⏭</button>
-          <div class="speed"><span>速度</span><input type="range" id="speed" min="120" max="1500" value="650" step="10" /></div>
-          <button id="exitReplayBtn" class="danger mini">✕ 退出回放</button>
+          <div id="statusLine" class="status-line">选择对手与执方，点击「开始对局」试玩</div>
         </div>
         <div class="ply-indicator" id="plyIndicator">—</div>
       </section>
@@ -231,6 +224,42 @@
         <div><button class="mini" id="codeCopy">复制</button> <button class="icon-btn" data-close="codeModal">✕</button></div>
       </div>
       <pre class="code-view"><code id="codeBody"></code></pre>
+    </div>
+  </div>
+
+  <!-- ===== 对局回放 弹窗（正式对局专用，独立于试玩棋盘） ===== -->
+  <div class="modal-mask hidden" id="replayModal">
+    <div class="modal replay-modal">
+      <div class="modal-head">
+        <h2 id="replayTitle">对局回放</h2>
+        <button class="icon-btn" data-close="replayModal">✕</button>
+      </div>
+      <div class="replay-body">
+        <div class="replay-left">
+          <div id="rBoard" class="board replay-board"></div>
+          <div class="playback">
+            <button id="rToStart">⏮</button><button id="rPrev">◀</button>
+            <button id="rPlayPause" class="primary">▶ 播放</button>
+            <button id="rNext">▶</button><button id="rToEnd">⏭</button>
+            <div class="speed"><span>速度</span><input type="range" id="rSpeed" min="120" max="1500" value="650" step="10" /></div>
+          </div>
+          <div class="ply-indicator" id="rPlyIndicator">—</div>
+        </div>
+        <aside class="replay-side">
+          <div id="rResultBanner" class="result-banner hidden"></div>
+          <div class="info-grid">
+            <div class="info-card black-side"><div class="side-name" id="rBlackName">黑方</div><div class="side-count"><span id="rBlackCount">6</span><small>子</small></div></div>
+            <div class="info-card red-side"><div class="side-name" id="rRedName">红方</div><div class="side-count"><span id="rRedCount">6</span><small>子</small></div></div>
+          </div>
+          <div class="meta-line">
+            <span>回合 <b id="rTurnNo">0</b></span>
+            <span>行棋 <b id="rToMove">—</b></span>
+            <span>无吃子 <b id="rNcm">0</b>/20</span>
+          </div>
+          <h3 class="movelist-title">棋谱</h3>
+          <ol id="rMoveList" class="move-list"></ol>
+        </aside>
+      </div>
     </div>
   </div>
 

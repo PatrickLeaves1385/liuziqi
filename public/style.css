@@ -56,7 +56,7 @@ button.danger:hover:not(:disabled) { border-color:var(--coral); color:var(--warn
 
 .controls { background:var(--card); border-radius:18px; padding:16px; display:grid; gap:10px; margin-bottom:16px; box-shadow:var(--shadow); }
 .ctrl-row { display:flex; align-items:center; gap:10px; }
-.ctrl-row label { width:64px; color:var(--muted); font-size:14px; display:flex; align-items:center; gap:6px; font-weight:600; }
+.ctrl-row label { min-width:64px; flex:0 0 auto; white-space:nowrap; color:var(--muted); font-size:14px; display:flex; align-items:center; gap:6px; font-weight:600; }
 .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
 .black-dot { background:var(--black); } .red-dot { background:var(--red); }
 select,input[type=text],input[type=email],input[type=password],input[type=number],textarea {
@@ -204,6 +204,14 @@ select:focus,input:focus,textarea:focus { outline:none; border-color:var(--mint)
 .modal-mask { position:fixed; inset:0; background:rgba(47,72,88,.32); display:flex; align-items:center; justify-content:center; z-index:50; padding:20px; }
 .modal { background:var(--card); border-radius:20px; padding:22px 24px; width:420px; max-width:100%; box-shadow:0 16px 40px rgba(47,72,88,.25); max-height:90vh; overflow:auto; }
 .modal-wide { width:680px; }
+/* ---- 对局回放弹窗 ---- */
+.replay-modal { width:900px; max-width:96vw; }
+.replay-body { display:grid; grid-template-columns:1.25fr 1fr; gap:20px; align-items:start; }
+.replay-left { display:flex; flex-direction:column; align-items:center; }
+.replay-board { max-width:420px; }
+.replay-side { min-width:0; }
+.replay-side .move-list { max-height:320px; }
+@media(max-width:820px){ .replay-body{ grid-template-columns:1fr; } }
 .modal-narrow { width:340px; text-align:center; }
 .modal-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; }
 .modal-head h2 { margin:0; font-size:18px; }
