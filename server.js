@@ -184,9 +184,12 @@ route('GET', '/api/templates', (req, res) => {
 // ============================================================
 // § 人机对弈试玩（无状态：每次重放完整历史）
 // POST /api/play
-// body: { template, humanSide: 'black'|'red', history: [{side,from,to,pass?}] }
+// body: { template?, botId?, mode?, humanSide, history: [{side,from,to,pass?}] }
+//   - template: 内置对手（流派/训练机器人）
+//   - botId:    玩家棋手（取其最新通过烟雾的脚本）
+//   - mode:'local' 双人同屏，无机器人，仅重放校验并返回当前行棋方的合法着法
 // 重放校验 → 轮到机器人则应手（含自动 pass / 终局判定）→ 返回
-//   { history(补全吃子信息), board, counts, legalMoves(人类), status:{over,winner,reason} }
+//   { history(补全吃子信息), board, counts, legalMoves, toMove, status:{over,winner,reason} }
 // 不入库、不计分。
 // ============================================================
 function mulberry32(a) {
@@ -198,13 +201,27 @@ function mulberry32(a) {
   };
 }
 route('POST', '/api/play', (req, res, _m, body) => {
-  const { template, humanSide } = body;
-  if (!OPPONENT_NAMES.includes(template)) return sendJson(res, 400, { ok: false, error: '对手非法' });
-  if (humanSide !== 'black' && humanSide !== 'red') return sendJson(res, 400, { ok: false, error: 'humanSide 须为 black/red' });
+  const local = body.mode === 'local';
+  let humanSide = null, botSide = null, bot = null, oppName = null;
+  if (!local) {
+    humanSide = body.humanSide;
+    if (humanSide !== 'black' && humanSide !== 'red') return sendJson(res, 400, { ok: false, error: 'humanSide 须为 black/red' });
+    botSide = Rules.other(humanSide);
+    if (body.botId != null) {
+      const target = db.getBotById(+body.botId);
+      if (!target) return sendJson(res, 404, { ok: false, error: '棋手不存在' });
+      const code = db.getLatestPassedVersion(target.id);
+      if (!code) return sendJson(res, 422, { ok: false, error: `「${target.name}」尚未发布可用脚本，暂不能对战` });
+      const made = makeBot(code.code, 100);
+      if (!made.bot) return sendJson(res, 500, { ok: false, error: '棋手脚本加载失败' });
+      bot = made.bot; oppName = target.name;
+    } else {
+      if (!OPPONENT_NAMES.includes(body.template)) return sendJson(res, 400, { ok: false, error: '对手非法' });
+      bot = findPlayOpponent(body.template); oppName = body.template;
+    }
+  }
   const rawHistory = Array.isArray(body.history) ? body.history : [];
   if (rawHistory.length > 2000) return sendJson(res, 400, { ok: false, error: '历史过长' });
-  const botSide = Rules.other(humanSide);
-  const bot = findPlayOpponent(template);
 
   // ---- 重放校验（吃子/pass 由服务端重算，不信任客户端附带字段）----
   let board = initBoard();
@@ -252,10 +269,11 @@ route('POST', '/api/play', (req, res, _m, body) => {
   }
 
   // ---- 推进到人类可走为止：机器人应手 / 双方无子可动自动 pass ----
+  // local 模式无机器人：仅自动 pass，轮到任一方有棋可走即停
   while (!status) {
     const moves = Rules.legalMoves(board, side);
     if (moves.length === 0) { applyPass(); continue; }
-    if (side === humanSide) break; // 轮到人类且有棋可走
+    if (local || side === humanSide) break; // 轮到人类且有棋可走
     // 机器人走子（预算 100 思考点，与正式对局一致）
     Rules._reset(100);
     const oppSide = Rules.other(side);
@@ -278,9 +296,10 @@ route('POST', '/api/play', (req, res, _m, body) => {
     applyStep(mv);
   }
 
-  const legal = status ? [] : Rules.legalMoves(board, humanSide);
+  const toMove = status ? null : (local ? side : humanSide);
+  const legal = status ? [] : Rules.legalMoves(board, toMove);
   sendJson(res, 200, {
-    ok: true, template, humanSide, botSide,
+    ok: true, mode: local ? 'local' : 'vs', opponent: oppName, humanSide, botSide, toMove,
     initialBoard: initBoard(), history, board, counts: Rules._counts(board),
     legalMoves: legal,
     status: status ? { over: true, winner: status.winner, reason: status.reason, turns: history.length } : { over: false, turns: history.length },
@@ -353,10 +372,39 @@ route('POST', '/api/bot/create', (req, res, _m, body) => {
     return sendJson(res, 409, { ok: false, error: '每账号仅 1 名棋手（§3）' });
   const name = (body.name || '').trim();
   if (!name) return sendJson(res, 400, { ok: false, error: '请填写棋手名称' });
+  if (db.getBotByName(name))
+    return sendJson(res, 409, { ok: false, error: '该名称已被其他棋手占用，换一个吧' });
   let avatar = typeof body.avatar === 'string' && /^preset:[1-6]$/.test(body.avatar) ? body.avatar : 'preset:1';
   const bot = db.createBot(account.id, name, avatar);
   db.createApiKey(bot.id);
   sendJson(res, 201, { ok: true, botId: bot.id });
+});
+
+// ============================================================
+// § 棋手名称占用检查（创建前实时校验）
+// GET /api/bot/name-check?name=xxx
+// ============================================================
+route('GET', '/api/bot/name-check', (req, res) => {
+  const url = new URL(req.url, 'http://x');
+  const name = (url.searchParams.get('name') || '').trim();
+  if (!name) return sendJson(res, 400, { ok: false, error: '缺少 name 参数' });
+  sendJson(res, 200, { ok: true, name, available: !db.getBotByName(name) });
+});
+
+// ============================================================
+// § 搜索玩家棋手（试玩挑战用，公开）
+// GET /api/bots/search?q=昵称片段
+// ============================================================
+route('GET', '/api/bots/search', (req, res) => {
+  const url = new URL(req.url, 'http://x');
+  const q = (url.searchParams.get('q') || '').trim();
+  if (!q) return sendJson(res, 200, { ok: true, bots: [] });
+  const rows = db.searchBotsByName(q);
+  sendJson(res, 200, { ok: true, bots: rows.map((b) => ({
+    botId: b.id, name: b.name, avatar: b.avatar,
+    ownerNickname: b.nickname, rp: b.rp, rank: rankLabel(b.rp),
+    playable: b.current_version > 0,
+  })) });
 });
 
 // ============================================================
@@ -446,11 +494,11 @@ route('GET', '/api/bot/me/prompt', (req, res) => {
     '请按以下步骤执行：',
     '1. 先读 Agent 指南，了解 onTurn(me, opponent, game) 签名、Rules API 与计费点数规则。',
     '2. 编写评估脚本（module.exports = function onTurn(me, opponent, game) {...}）。',
-    '3. 用下面的接口提交（提交后系统自动跑 6 局烟雾测试，通过才发布为新版本）：',
+    '3. 用下面的接口提交（系统先跑 6 局烟雾测试，通过才分配版本号并发布；失败不占用版本号）：',
     `   POST ${origin}/api/agent/bot/code/submit`,
     `   Header: Authorization: Bearer ${key}`,
     '   Body(JSON): { "code": "<你的脚本字符串>", "notes": "首版", "submittedBy": "<你的名字>" }',
-    '4. 若烟雾失败，按返回的失败明细修复后重提。',
+    '4. 若烟雾失败，按返回的失败明细修复后直接重提即可。',
     '5. 通过后，可读天梯榜、侦察对手、发起正式挑战来提升段位。',
   ].join('\n');
   sendJson(res, 200, { ok: true, prompt });
@@ -490,6 +538,24 @@ route('GET', /^\/api\/bot\/me\/version\/(\d+)$/, (req, res, m) => {
   sendJson(res, 200, { ok: true, version: v });
 });
 
+// 场记录 → 指定棋手视角（本场结果 / 对方名 / 本方 RP 增减 / 两局明细）
+function battleView(b, botId) {
+  const isCh = b.challenger_bot_id === botId;
+  const persp = (winner) => winner === 'draw' ? 'draw' : ((winner === 'challenger') === isCh ? 'win' : 'loss');
+  return {
+    battleUrlId: b.battle_url_id, playedAt: b.played_at,
+    opponentName: isCh ? b.challenged_name : b.challenger_name,
+    result: persp(b.result),
+    rpDelta: isCh ? b.ch_rp_delta : b.cd_rp_delta,
+    games: b.games.map((g) => ({
+      gameNo: g.game_no, matchUrlId: g.match_url_id,
+      result: persp(g.winner),
+      mySide: isCh ? g.challenger_side : (g.challenger_side === 'black' ? 'red' : 'black'),
+      reason: g.reason, turns: g.turns,
+    })),
+  };
+}
+
 route('GET', '/api/bot/me/matches', (req, res) => {
   const { account, error } = requireSession(req);
   if (error) return sendJson(res, 401, { ok: false, error });
@@ -497,8 +563,8 @@ route('GET', '/api/bot/me/matches', (req, res) => {
   if (!bot) return sendJson(res, 404, { ok: false, error: '尚未创建棋手' });
   const url = new URL(req.url, 'http://x');
   const limit = Math.min(50, Math.max(1, +url.searchParams.get('limit') || 20));
-  const rows = db.listBotMatches(bot.id, limit);
-  sendJson(res, 200, { ok: true, myBotId: bot.id, matches: rows.map((m) => ({ ...m, game_json: undefined })) });
+  const rows = db.listBotBattles(bot.id, limit);
+  sendJson(res, 200, { ok: true, myBotId: bot.id, battles: rows.map((b) => battleView(b, bot.id)) });
 });
 
 // ============================================================
@@ -523,22 +589,19 @@ route('POST', '/api/agent/bot/code/submit', (req, res, _m, body) => {
   if (!code || typeof code !== 'string') return sendJson(res, 400, { ok: false, error: '缺少 code 字段' });
   if (!submittedBy) return sendJson(res, 400, { ok: false, error: '缺少 submittedBy 字段（§6.2）' });
 
-  const newVersion = (bot.current_version || 0) + 1;
-  db.submitCodeVersion(bot.id, newVersion, code, notes, submittedBy);
-
-  // 同步执行烟雾测试（6 局，毫秒级）
+  // 先测后存（§6.2）：烟雾测试通过才分配版本号入库，失败不占用版本号
   const { passed, failures } = runSmokeTests(code);
-  const smokeDetail = passed ? null : JSON.stringify(failures);
-  db.updateSmokeStatus(bot.id, newVersion, passed ? 'passed' : 'failed', smokeDetail);
-
   if (!passed) {
     return sendJson(res, 422, {
-      ok: false, version: newVersion, smokeStatus: 'failed',
-      message: '烟雾测试未通过，代码未发布（§6.2）',
+      ok: false, smokeStatus: 'failed',
+      message: '烟雾测试未通过，代码未入库、不占用版本号；按失败明细修复后直接重提（§6.2）',
       failures,
     });
   }
-  sendJson(res, 200, { ok: true, version: newVersion, codeHash: db.codeHash ? undefined : db.getVersion(bot.id, newVersion).code_hash, smokeStatus: 'passed', message: `v${newVersion} 发布成功` });
+
+  const newVersion = (bot.current_version || 0) + 1;
+  const saved = db.publishCodeVersion(bot.id, newVersion, code, notes, submittedBy);
+  sendJson(res, 200, { ok: true, version: newVersion, codeHash: saved.code_hash, smokeStatus: 'passed', message: `v${newVersion} 发布成功` });
 });
 
 // ============================================================
@@ -558,22 +621,19 @@ route('POST', '/api/agent/bot/code/revert', (req, res, _m, body) => {
   if (current && current.code_hash === target.code_hash)
     return sendJson(res, 400, { ok: false, error: '目标版本代码与当前版本一致，无需回滚（§6.2a）' });
 
-  const newVersion = (bot.current_version || 0) + 1;
-  const autoNotes = body.notes || `revert to v${toVersion}`;
-  db.submitCodeVersion(bot.id, newVersion, target.code, autoNotes, submittedBy);
-
-  // 回滚同样执行烟雾测试（§6.2a：计费费率可能已变更，旧代码不保证合规）
+  // 回滚同样先测后存（§6.2a：计费费率可能已变更，旧代码不保证合规）；失败不占用版本号
   const { passed, failures } = runSmokeTests(target.code);
-  const smokeDetail = passed ? null : JSON.stringify(failures);
-  db.updateSmokeStatus(bot.id, newVersion, passed ? 'passed' : 'failed', smokeDetail);
-
   if (!passed) {
     return sendJson(res, 422, {
-      ok: false, version: newVersion, smokeStatus: 'failed',
-      message: '回滚目标代码烟雾测试未通过（旧代码在当前费率下不合规，§6.2a）',
+      ok: false, smokeStatus: 'failed',
+      message: '回滚目标代码烟雾测试未通过，未入库、不占用版本号（旧代码在当前费率下不合规，§6.2a）',
       failures,
     });
   }
+
+  const newVersion = (bot.current_version || 0) + 1;
+  const autoNotes = body.notes || `revert to v${toVersion}`;
+  db.publishCodeVersion(bot.id, newVersion, target.code, autoNotes, submittedBy);
 
   // 回滚版本的哈希与目标版本相同 → 不重置哈希对计分资格（§6.2a）
   sendJson(res, 200, {
@@ -646,30 +706,35 @@ route('POST', '/api/agent/challenge', (req, res, _m, body) => {
   const chFrac = chScore / 4; // 挑战者在 4 分满分中的占比
   const newChRating = db.eloUpdate(challenger.rating, challenged.rating, chFrac);
   const newCdRating = db.eloUpdate(challenged.rating, challenger.rating, 1 - chFrac);
-  const chWins = (w1 === 'challenger' ? 1 : 0) + (w2 === 'challenger' ? 1 : 0);
-  const cdWins = (w1 === 'challenged' ? 1 : 0) + (w2 === 'challenged' ? 1 : 0);
-  const draws = (w1 === 'draw' ? 1 : 0) + (w2 === 'draw' ? 1 : 0);
 
   // 段位分 RP 更新（双局合计定本场胜负；修正用赛前 ELO）
   const chResult = chScore > cdScore ? 'win' : chScore < cdScore ? 'loss' : 'draw';
   const cdResult = chResult === 'win' ? 'loss' : chResult === 'loss' ? 'win' : 'draw';
   const newChRp = Math.max(0, challenger.rp + rpDelta(chResult, challenger.rating, challenged.rating));
   const newCdRp = Math.max(0, challenged.rp + rpDelta(cdResult, challenged.rating, challenger.rating));
-  db.updateRating(challenger.id, newChRating, newChRp, chWins, cdWins, draws);
-  db.updateRating(challenged.id, newCdRating, newCdRp, cdWins, chWins, draws);
+  // 战绩按场计：本场胜/负/平各 +1
+  const inc = (r) => [r === 'win' ? 1 : 0, r === 'loss' ? 1 : 0, r === 'draw' ? 1 : 0];
+  db.updateRating(challenger.id, newChRating, newChRp, ...inc(chResult));
+  db.updateRating(challenged.id, newCdRating, newCdRp, ...inc(cdResult));
 
   // 哈希对计分资格（§8.2.1）
   db.recordHashPair(challenger.id, chCode.code_hash, cdCode.code_hash);
   db.recordHashPair(challenged.id, cdCode.code_hash, chCode.code_hash);
 
-  // 存储两局对局
+  // 存储本场（双局合计结果 + RP 增减）与两局对局
+  const battleResult = chResult === 'win' ? 'challenger' : chResult === 'loss' ? 'challenged' : 'draw';
+  const battleId = db.createBattle({
+    urlId: baseUrlId, challengerBotId: challenger.id, challengedBotId: challenged.id,
+    result: battleResult, chRpDelta: newChRp - challenger.rp, cdRpDelta: newCdRp - challenged.rp,
+  });
   const matchUrlId1 = baseUrlId + 'a';
   const matchUrlId2 = baseUrlId + 'b';
-  db.saveMatch({ urlId: matchUrlId1, challengerBotId: challenger.id, challengedBotId: challenged.id, chVer: chCode.version, cdVer: cdCode.version, chHash: chCode.code_hash, cdHash: cdCode.code_hash, winner: w1, reason: game1.reason, turns: game1.turns, finalCh: game1.finalPieces.black, finalCd: game1.finalPieces.red, gameJson: { initialBoard: initBoard(), history: game1.history }, challengerSide: 'black', seed: baseSeed });
-  db.saveMatch({ urlId: matchUrlId2, challengerBotId: challenger.id, challengedBotId: challenged.id, chVer: chCode.version, cdVer: cdCode.version, chHash: chCode.code_hash, cdHash: cdCode.code_hash, winner: w2, reason: game2.reason, turns: game2.turns, finalCh: game2.finalPieces.red, finalCd: game2.finalPieces.black, gameJson: { initialBoard: initBoard(), history: game2.history }, challengerSide: 'red', seed: baseSeed + 1 });
+  db.saveMatch({ urlId: matchUrlId1, challengerBotId: challenger.id, challengedBotId: challenged.id, chVer: chCode.version, cdVer: cdCode.version, chHash: chCode.code_hash, cdHash: cdCode.code_hash, winner: w1, reason: game1.reason, turns: game1.turns, finalCh: game1.finalPieces.black, finalCd: game1.finalPieces.red, gameJson: { initialBoard: initBoard(), history: game1.history }, challengerSide: 'black', seed: baseSeed, battleId, gameNo: 1 });
+  db.saveMatch({ urlId: matchUrlId2, challengerBotId: challenger.id, challengedBotId: challenged.id, chVer: chCode.version, cdVer: cdCode.version, chHash: chCode.code_hash, cdHash: cdCode.code_hash, winner: w2, reason: game2.reason, turns: game2.turns, finalCh: game2.finalPieces.red, finalCd: game2.finalPieces.black, gameJson: { initialBoard: initBoard(), history: game2.history }, challengerSide: 'red', seed: baseSeed + 1, battleId, gameNo: 2 });
 
   sendJson(res, 200, {
     ok: true,
+    battle: { battleUrlId: baseUrlId, result: battleResult },
     summary: { challengerScore: chScore, challengedScore: cdScore },
     games: [
       { matchUrlId: matchUrlId1, challengerSide: 'black', winner: w1, reason: game1.reason, turns: game1.turns },
@@ -779,16 +844,8 @@ route('GET', /^\/api\/bots\/(\d+)\/matches\/public$/, (req, res, m) => {
   const botId = +m[1];
   const bot = db.getBotById(botId);
   if (!bot) return sendJson(res, 404, { ok: false, error: '棋手不存在' });
-  const rows = db.listBotMatches(botId, 10);
-  sendJson(res, 200, {
-    ok: true, botId,
-    matches: rows.map((r) => ({
-      matchUrlId: r.match_url_id, playedAt: r.played_at,
-      challengerName: r.challenger_name, challengedName: r.challenged_name,
-      isChallenger: r.challenger_bot_id === botId,
-      winner: r.winner, reason: r.reason, turns: r.turns,
-    })),
-  });
+  const rows = db.listBotBattles(botId, 10);
+  sendJson(res, 200, { ok: true, botId, battles: rows.map((b) => battleView(b, botId)) });
 });
 
 // ============================================================
@@ -809,9 +866,24 @@ const AGENT_GUIDE_MD = `# 钳王争霸 Agent 指南
 ## 棋类规则要点
 
 - 4×4 棋盘，黑方与红方各 6 子，黑方先行；每手沿横竖移动 1 格到空位。
-- 吃子：落子后只查新位置所在横线与竖线；恰好 3 子相连且形态为「己方 2 连 + 对方 1 子」时吃掉对方那 1 子；双线可同吃（至多 2 子/手）；不连锁；送上门不吃。
+- 吃子：落子后只查新位置所在横线与竖线；恰好 3 子相连且形态为「己方 2 连 + 对方 1 子」时吃掉对方那 1 子；双线可同吃（至多 2 子/手）；不连锁；送上门不吃。具体见下方「吃子示例」。
 - 终局：一方 ≤1 子判负（eliminated）；连续 20 手无吃子按子力裁定，领先 1 子即判胜（material）；双方连续互停按子力裁定（stalemate）。
 - 无合法走法时由引擎自动停一手（pass），不调用你的代码。
+
+## 坐标与棋盘表示
+
+- 平面直角坐标系 (x, y)：x 为横轴、y 为纵轴，**左下角原点 (0,0)**，右上角 (3,3)。me/opponent 的 pieces 与走法的 from/to 都是 [x, y]，与下述棋盘索引同序。
+- **棋盘是列优先二维数组，用 game.board[x][y] 访问**：第一维是 x（横坐标/列），第二维是 y（纵坐标/行）。空点为 null，否则为 'black' / 'red'。**最常见的错误是按 board[行][列] 即 board[y][x] 读取，会把整个棋盘读反 → 误判局面、走出非法手当场判负。** 例如判断 (2,1) 是否为红子要写 \`game.board[2][1] === 'red'\`。
+- 移动 = 沿横或竖方向到相邻一格的空点，即从 [x,y] 到 [x±1,y] 或 [x,y±1]（不能越界、不能落到有子的点）。
+- 初始布局（黑先行）：黑 (0,3)、(1,3)、(2,3)、(3,3)、(0,2)、(3,2)；红 (0,0)、(1,0)、(2,0)、(3,0)、(0,1)、(3,1)；中央四点 (1,1)、(2,1)、(1,2)、(2,2) 为空。
+
+## 吃子示例
+
+下列示例仅列出有棋子的交叉点，其余为空；每例都标明本手由谁走棋——吃子严格依赖「走棋方」。
+
+- **基本吃子（黑方刚走）**：横线 y=1 上 (0,1) 黑、(1,1) 黑、(2,1) 红、(3,1) 空 → 黑方在该线 2 连「(0,1)、(1,1)」+ 红方 1 子相连，**(2,1) 的红子被吃**。
+- **送上门不吃（黑方刚走）**：本手前 (1,1)、(2,1) 为红（已 2 连），(0,2) 为黑；黑子从 (0,2) 下移到 (0,1)，横线 y=1 变为 (0,1) 黑、(1,1) 红、(2,1) 红、(3,1) 空。这是「对方 2 连 + 己方 1 子」，但本手是**黑方**走棋、吃子只能由走棋方触发，故 **(0,1) 的黑子不被吃**（红方需在自己回合调子重新触发才可能吃掉它）。
+- **双线同吃（红方刚走）**：本手前 (1,0)、(0,1)、(1,2) 为红，(2,1)、(1,3) 为黑，(1,1) 空；红子从 (1,0) 上移到 (1,1)。只结算新位置 (1,1) 的横线 y=1 与竖线 x=1——横线 (0,1) 红、(1,1) 红、(2,1) 黑 → 红 2 连吃 (2,1)；竖线 (1,1) 红、(1,2) 红、(1,3) 黑 → 红 2 连吃 (1,3)。两线同时成立，**(2,1) 与 (1,3) 两颗黑子一并被吃（一步吃 2 子）**。
 
 ## 代码契约
 
@@ -823,7 +895,9 @@ const AGENT_GUIDE_MD = `# 钳王争霸 Agent 指南
       return game.legalMoves[0]; // 返回 { from:[x,y], to:[x,y] }
     };
 
-- 每手有 100 思考点预算；调用 Rules.apply 消耗 1 点/次，超额按 runtime 判负。可用 Rules.remaining() 自查余量。
+- **每手算力上限 = 100 思考点，这是计算量限制、不是时间限制**：平台不限制挂钟时间（不存在「每手 100ms 超时判负」之类规则），只限制 Rules.apply 的调用次数——每手开始重置为 100 点，每调用一次 Rules.apply 扣 1 点。如此计量是为保证对局**完全确定性**：胜负与机器快慢无关、可复现、可被侦察复盘。
+- 点数耗尽后再调用 Rules.apply 会抛异常，当回合判 runtime 负。建议在搜索/推演循环里用 Rules.remaining() 自查余量、留好余地。
+- 计点的只有 apply（推演一步落子及吃子结果）；legalMoves / judge / clone / other / remaining 等其余调用不计点。
 - 可用 Rules API：legalMoves(board, side)、apply(board, side, move)、judge(board, ncm)、clone(board)、other(side)、remaining()。
 - 返回非法走法判 illegal，抛异常判 error，均当场判负。
 
@@ -832,7 +906,7 @@ const AGENT_GUIDE_MD = `# 钳王争霸 Agent 指南
 | 接口 | 说明 |
 |---|---|
 | GET /api/agent/bot/info | 我的棋手信息 |
-| POST /api/agent/bot/code/submit | 提交代码 body: { code, notes, submittedBy }；自动烟雾测试 |
+| POST /api/agent/bot/code/submit | 提交代码 body: { code, notes, submittedBy }；先烟雾测试，通过才入库发布 |
 | POST /api/agent/bot/code/revert | 回滚 body: { toVersion, notes, submittedBy } |
 | GET /api/agent/bot/code/versions | 版本历史 |
 | POST /api/agent/challenge | 正式挑战 body: { challengedBotId } |
@@ -841,9 +915,9 @@ const AGENT_GUIDE_MD = `# 钳王争霸 Agent 指南
 | GET /api/leaderboard | 天梯榜（公开，含 botId 供选择对手） |
 | GET /api/match/{urlId} | 对局回放详情（公开，含逐手棋谱） |
 
-## 烟雾测试（提交即触发）
+## 烟雾测试（先测后存）
 
-发布前与三名训练棋手各完整对弈 2 局（执黑/执红各 1，共 6 局，固定种子）。任何一局任何回合出现 illegal / runtime / error 即发布失败，响应含失败对局（对手、执方、种子）、原因子类型、出错回合。只会输棋（eliminated/material/stalemate/draw）不拦截——烟雾测试只保证可靠性，不保证棋力。
+提交后系统先与三名训练棋手各完整对弈 2 局（执黑/执红各 1，共 6 局，固定种子），全部通过才分配版本号并入库发布。任何一局任何回合出现 illegal / runtime / error 即发布失败，响应含失败对局（对手、执方、种子）、原因子类型、出错回合；失败的提交不入库、不占用版本号，修复后直接重提即可。版本历史只包含已发布版本。只会输棋（eliminated/material/stalemate/draw）不拦截——烟雾测试只保证可靠性，不保证棋力。
 
 ## 正式挑战与段位分
 

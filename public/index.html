@@ -23,10 +23,20 @@
 
   <!-- ===== 人机试玩 ===== -->
   <section id="tab-play" class="tab-panel active">
+    <div class="subtabs play-subtabs">
+      <button class="subtab active" data-playmode="ai">挑战棋手</button>
+      <button class="subtab" data-playmode="local">双人同屏</button>
+    </div>
     <div class="layout">
       <section class="left">
         <div class="controls" id="playControls">
           <div class="ctrl-row"><label>对手</label><select id="oppSel"></select></div>
+          <div class="ctrl-row"><label>搜索棋手</label>
+            <div class="search-box">
+              <input id="botSearch" type="text" placeholder="输入棋手昵称，挑战玩家棋手" autocomplete="off" />
+              <div id="botSearchResults" class="search-results hidden"></div>
+            </div>
+          </div>
           <div class="ctrl-row"><label>我的执方</label><select id="sideSel">
             <option value="black">梭子蟹（黑方 · 先手）</option>
             <option value="red">龙虾（红方 · 后手）</option>
@@ -34,6 +44,14 @@
           <div class="btn-row">
             <button id="startPlayBtn" class="primary" style="flex:1">开始对局</button>
             <button id="undoBtn" disabled>悔棋（剩 3 次）</button>
+          </div>
+        </div>
+        <div class="controls hidden" id="localControls">
+          <div class="ctrl-row"><label>玩家 1</label><input id="p1Name" type="text" placeholder="执黑（梭子蟹 · 先手）" /></div>
+          <div class="ctrl-row"><label>玩家 2</label><input id="p2Name" type="text" placeholder="执红（龙虾 · 后手）" /></div>
+          <div class="btn-row">
+            <button id="startLocalBtn" class="primary" style="flex:1">开始对局</button>
+            <button id="undoLocalBtn" disabled>悔一手</button>
           </div>
         </div>
         <div class="board-wrap">
@@ -107,9 +125,23 @@
         <h3>棋类规则要点</h3>
         <ul>
           <li>4×4 棋盘，黑方与红方各 6 子，黑方先行；每手沿横竖移动 1 格到空位。</li>
-          <li><b>吃子</b>：落子后只查新位置所在横线与竖线；恰好 3 子相连且形态为「己方 2 连 + 对方 1 子」时吃掉对方那 1 子；双线可同吃（至多 2 子/手）；不连锁；送上门不吃。</li>
+          <li><b>吃子</b>：落子后只查新位置所在横线与竖线；恰好 3 子相连且形态为「己方 2 连 + 对方 1 子」时吃掉对方那 1 子；双线可同吃（至多 2 子/手）；不连锁；送上门不吃。具体见下方「吃子示例」。</li>
           <li><b>终局</b>：一方 ≤1 子判负（eliminated）；连续 20 手无吃子按子力裁定，领先 1 子即判胜（material）；双方连续互停按子力裁定（stalemate）。</li>
           <li>无合法走法时由引擎自动停一手（pass），不调用你的代码。</li>
+        </ul>
+        <h3>坐标与棋盘表示</h3>
+        <ul>
+          <li>平面直角坐标系 <code>(x, y)</code>：x 为横轴、y 为纵轴，<b>左下角原点 (0,0)</b>，右上角 (3,3)。<code>pieces</code> 与走法的 <code>from</code> / <code>to</code> 都是 <code>[x, y]</code>，与棋盘索引同序。</li>
+          <li><b>棋盘是列优先二维数组，用 <code>game.board[x][y]</code> 访问</b>：第一维是 x（横坐标/列），第二维是 y（纵坐标/行）。空点为 <code>null</code>，否则为 <code>'black'</code> / <code>'red'</code>。<b>最常见错误是按 <code>board[行][列]</code> 即 <code>board[y][x]</code> 读取，会把整个棋盘读反，导致误判与非法手判负。</b>例如判断 (2,1) 是否为红子应写 <code>game.board[2][1] === 'red'</code>。</li>
+          <li>移动 = 沿横或竖到相邻一格空点，即从 <code>[x,y]</code> 到 <code>[x±1,y]</code> 或 <code>[x,y±1]</code>（不越界、不落到有子的点）。</li>
+          <li>初始布局（黑先行）：黑 (0,3)、(1,3)、(2,3)、(3,3)、(0,2)、(3,2)；红 (0,0)、(1,0)、(2,0)、(3,0)、(0,1)、(3,1)；中央 (1,1)、(2,1)、(1,2)、(2,2) 为空。</li>
+        </ul>
+        <h3>吃子示例</h3>
+        <p class="muted">仅列出有棋子的交叉点，其余为空；每例标明本手由谁走棋——吃子严格依赖「走棋方」。</p>
+        <ul>
+          <li><b>基本吃子（黑方刚走）</b>：横线 y=1 上 (0,1) 黑、(1,1) 黑、(2,1) 红、(3,1) 空 → 黑方 2 连「(0,1)、(1,1)」+ 红 1 子相连，<b>(2,1) 红子被吃</b>。</li>
+          <li><b>送上门不吃（黑方刚走）</b>：本手前 (1,1)、(2,1) 为红（已 2 连），(0,2) 为黑；黑子从 (0,2) 移到 (0,1)，横线 y=1 成「(0,1) 黑 + (1,1)、(2,1) 红 2 连」。虽是「对方 2 连 + 己方 1 子」，但吃子只能由走棋方触发，本手黑走 → <b>(0,1) 黑子不被吃</b>。</li>
+          <li><b>双线同吃（红方刚走）</b>：本手前 (1,0)、(0,1)、(1,2) 为红，(2,1)、(1,3) 为黑，(1,1) 空；红子从 (1,0) 移到 (1,1)。只结算新位置 (1,1) 的横线 y=1（(0,1)、(1,1) 红 2 连 → 吃 (2,1) 黑）与竖线 x=1（(1,1)、(1,2) 红 2 连 → 吃 (1,3) 黑）→ <b>一步吃 (2,1)、(1,3) 两子</b>。</li>
         </ul>
         <h3>代码契约</h3>
         <pre><code>module.exports = function onTurn(me, opponent, game) {
@@ -118,7 +150,8 @@
   return game.legalMoves[0]; // 返回 { from:[x,y], to:[x,y] }
 };</code></pre>
         <ul>
-          <li>每手 100 思考点预算；<code>Rules.apply</code> 消耗 1 点/次，超额按 runtime 判负；可用 <code>Rules.remaining()</code> 自查。</li>
+          <li><b>每手算力上限 = 100 思考点，是计算量限制、非时间限制</b>：平台不限挂钟时间（不存在「每手 100ms 超时判负」之类规则），只限 <code>Rules.apply</code> 调用次数——每手重置为 100 点、每次 <code>apply</code> 扣 1 点，以保证对局<b>完全确定</b>（与机器快慢无关、可复现、可侦察）。</li>
+          <li>点数耗尽后再 <code>apply</code> 会抛异常 → 当回合判 <code>runtime</code> 负；搜索时用 <code>Rules.remaining()</code> 自查余量。仅 <code>apply</code> 计点，<code>legalMoves / judge / clone / other</code> 不计点。</li>
           <li>可用 Rules API：<code>legalMoves / apply / judge / clone / other / remaining</code>。</li>
           <li>返回非法走法判 illegal，抛异常判 error，均当场判负。</li>
         </ul>
@@ -168,7 +201,7 @@
       <div id="authRegister">
         <p class="modal-sub">第 1 步 · 注册后再创建棋手。</p>
         <div class="field"><label>昵称</label><input id="reg-nick" placeholder="你的公开昵称" /><div class="field-err" id="err-nick"></div></div>
-        <div class="field"><label>邮箱</label><input id="reg-email" type="email" placeholder="you@example.com" /></div>
+        <div class="field"><label>邮箱</label><input id="reg-email" type="email" placeholder="you@example.com" /><div class="field-err" id="err-email"></div></div>
         <div class="field"><label>密码</label><input id="reg-pw" type="password" placeholder="至少 8 位" /></div>
         <div class="field"><label>确认密码</label><input id="reg-pw2" type="password" placeholder="再输入一次" /><div class="field-err" id="err-pw2"></div></div>
         <button class="primary block" id="regBtn" disabled>注册</button>
@@ -234,6 +267,7 @@
         <h2 id="replayTitle">对局回放</h2>
         <button class="icon-btn" data-close="replayModal">✕</button>
       </div>
+      <div id="rGameTabs" class="replay-tabs hidden"></div>
       <div class="replay-body">
         <div class="replay-left">
           <div id="rBoard" class="board replay-board"></div>

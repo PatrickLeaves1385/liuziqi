@@ -59,6 +59,19 @@ CREATE TABLE IF NOT EXISTS code_versions (
   FOREIGN KEY (bot_id) REFERENCES bots(id)
 );
 
+CREATE TABLE IF NOT EXISTS battles (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  battle_url_id     TEXT    UNIQUE NOT NULL,
+  challenger_bot_id INTEGER NOT NULL,
+  challenged_bot_id INTEGER NOT NULL,
+  result            TEXT    NOT NULL,   -- 'challenger' | 'challenged' | 'draw'（双局合计的本场结果）
+  ch_rp_delta       INTEGER,            -- 本场挑战者 RP 增减（历史回填数据为 NULL）
+  cd_rp_delta       INTEGER,
+  played_at         INTEGER NOT NULL,
+  FOREIGN KEY (challenger_bot_id) REFERENCES bots(id),
+  FOREIGN KEY (challenged_bot_id) REFERENCES bots(id)
+);
+
 CREATE TABLE IF NOT EXISTS matches (
   id                       INTEGER PRIMARY KEY AUTOINCREMENT,
   match_url_id             TEXT    UNIQUE NOT NULL,
@@ -94,7 +107,64 @@ CREATE TABLE IF NOT EXISTS hash_pair_scores (
 CREATE INDEX IF NOT EXISTS idx_matches_challenger ON matches(challenger_bot_id);
 CREATE INDEX IF NOT EXISTS idx_matches_challenged ON matches(challenged_bot_id);
 CREATE INDEX IF NOT EXISTS idx_code_bot ON code_versions(bot_id);
+CREATE INDEX IF NOT EXISTS idx_battles_challenger ON battles(challenger_bot_id);
+CREATE INDEX IF NOT EXISTS idx_battles_challenged ON battles(challenged_bot_id);
 `);
+
+// ---- 增量迁移：matches 关联到场（battle）----
+const matchCols = db.prepare('PRAGMA table_info(matches)').all().map((c) => c.name);
+if (!matchCols.includes('battle_id')) db.exec('ALTER TABLE matches ADD COLUMN battle_id INTEGER');
+if (!matchCols.includes('game_no')) db.exec('ALTER TABLE matches ADD COLUMN game_no INTEGER');
+db.exec('CREATE INDEX IF NOT EXISTS idx_matches_battle ON matches(battle_id)');
+
+// 战绩口径为「场」：从 battles 全量重算各棋手 W/L/D（幂等）
+function recomputeBotStats() {
+  const calc = db.prepare(`
+    SELECT
+      SUM(CASE WHEN (challenger_bot_id=? AND result='challenger') OR (challenged_bot_id=? AND result='challenged') THEN 1 ELSE 0 END) AS w,
+      SUM(CASE WHEN (challenger_bot_id=? AND result='challenged') OR (challenged_bot_id=? AND result='challenger') THEN 1 ELSE 0 END) AS l,
+      SUM(CASE WHEN result='draw' THEN 1 ELSE 0 END) AS d
+    FROM battles WHERE challenger_bot_id=? OR challenged_bot_id=?`);
+  const setStats = db.prepare('UPDATE bots SET wins=?,losses=?,draws=? WHERE id=?');
+  for (const b of db.prepare('SELECT id FROM bots').all()) {
+    const r = calc.get(b.id, b.id, b.id, b.id, b.id, b.id);
+    setStats.run(r.w || 0, r.l || 0, r.d || 0, b.id);
+  }
+}
+
+// 历史数据回填：旧两局记录按 urlId 前缀（…a / …b）归并为一场。
+// 本场结果按双局合计分（胜2/平1/负0）判定；当时的 RP 增减未记录，留 NULL。
+// 回填后顺带把旧的按局战绩重算为按场。
+(function backfillBattles() {
+  const orphans = db.prepare(
+    'SELECT id,match_url_id,challenger_bot_id,challenged_bot_id,winner,played_at FROM matches WHERE battle_id IS NULL ORDER BY id'
+  ).all();
+  if (!orphans.length) return;
+  const groups = new Map();
+  for (const m of orphans) {
+    const suffix = m.match_url_id.slice(-1);
+    if (suffix !== 'a' && suffix !== 'b') continue;
+    const prefix = m.match_url_id.slice(0, -1);
+    if (!groups.has(prefix)) groups.set(prefix, {});
+    groups.get(prefix)[suffix] = m;
+  }
+  const insBattle = db.prepare('INSERT INTO battles(battle_url_id,challenger_bot_id,challenged_bot_id,result,ch_rp_delta,cd_rp_delta,played_at) VALUES(?,?,?,?,?,?,?)');
+  const linkMatch = db.prepare('UPDATE matches SET battle_id=?,game_no=? WHERE id=?');
+  for (const [prefix, g] of groups) {
+    if (!g.a || !g.b) continue;
+    let ch = 0, cd = 0;
+    for (const m of [g.a, g.b]) {
+      if (m.winner === 'challenger') ch += 2;
+      else if (m.winner === 'challenged') cd += 2;
+      else { ch += 1; cd += 1; }
+    }
+    const result = ch > cd ? 'challenger' : ch < cd ? 'challenged' : 'draw';
+    const r = insBattle.run(prefix, g.a.challenger_bot_id, g.a.challenged_bot_id, result, null, null, Math.max(g.a.played_at, g.b.played_at));
+    linkMatch.run(r.lastInsertRowid, 1, g.a.id);
+    linkMatch.run(r.lastInsertRowid, 2, g.b.id);
+  }
+  recomputeBotStats();
+})();
 
 // ---- 工具函数 ----
 function hashKey(key) { return crypto.createHash('sha256').update(key).digest('hex'); }
@@ -112,6 +182,12 @@ const stmtGetAccountById = db.prepare('SELECT * FROM accounts WHERE id=?');
 // ---- 棋手 ----
 const stmtInsertBot = db.prepare('INSERT INTO bots(account_id,name,avatar,created_at) VALUES(?,?,?,?)');
 const stmtGetBotById = db.prepare('SELECT * FROM bots WHERE id=?');
+const stmtGetBotByName = db.prepare('SELECT * FROM bots WHERE name=?');
+const stmtSearchBots = db.prepare(`
+  SELECT b.id,b.name,b.avatar,b.rp,b.current_version,a.nickname
+  FROM bots b JOIN accounts a ON b.account_id=a.id
+  WHERE b.name LIKE ? ESCAPE '\\'
+  ORDER BY b.rp DESC, b.id ASC LIMIT 20`);
 const stmtGetBotByAccount = db.prepare('SELECT * FROM bots WHERE account_id=?');
 const stmtUpdateBotVersion = db.prepare('UPDATE bots SET current_version=? WHERE id=?');
 const stmtUpdateBotAvatar = db.prepare('UPDATE bots SET avatar=? WHERE id=?');
@@ -137,17 +213,31 @@ const stmtGetBotByKey = db.prepare(`
 const stmtInsertVersion = db.prepare(`
   INSERT INTO code_versions(bot_id,version,code,code_hash,notes,submitted_by,smoke_status,smoke_detail,created_at)
   VALUES(?,?,?,?,?,?,?,?,?)`);
-const stmtUpdateSmokeStatus = db.prepare('UPDATE code_versions SET smoke_status=?,smoke_detail=? WHERE bot_id=? AND version=?');
 const stmtGetVersion = db.prepare('SELECT * FROM code_versions WHERE bot_id=? AND version=?');
+// 历史遗留：早期"先存后测"流程留下的未通过记录会占用版本号，发布前清掉同号及以上的幽灵记录
+const stmtDeleteStaleVersions = db.prepare("DELETE FROM code_versions WHERE bot_id=? AND version>=? AND smoke_status<>'passed'");
 const stmtListVersions = db.prepare('SELECT id,bot_id,version,code_hash,notes,submitted_by,smoke_status,created_at FROM code_versions WHERE bot_id=? ORDER BY version DESC LIMIT 50');
 const stmtGetCurrentCode = db.prepare('SELECT * FROM code_versions WHERE bot_id=? AND smoke_status=? ORDER BY version DESC LIMIT 1');
+
+// ---- 场（battle，一场 = 双局）----
+const stmtInsertBattle = db.prepare(`
+  INSERT INTO battles(battle_url_id,challenger_bot_id,challenged_bot_id,result,ch_rp_delta,cd_rp_delta,played_at)
+  VALUES(?,?,?,?,?,?,?)`);
+const stmtListBotBattles = db.prepare(`
+  SELECT bt.*, cb.name AS challenger_name, db2.name AS challenged_name
+  FROM battles bt
+  JOIN bots cb ON bt.challenger_bot_id=cb.id
+  JOIN bots db2 ON bt.challenged_bot_id=db2.id
+  WHERE bt.challenger_bot_id=? OR bt.challenged_bot_id=?
+  ORDER BY bt.played_at DESC LIMIT ?`);
+const stmtBattleGames = db.prepare('SELECT game_no,match_url_id,winner,reason,turns,challenger_side FROM matches WHERE battle_id=? ORDER BY game_no');
 
 // ---- 对局 ----
 const stmtInsertMatch = db.prepare(`
   INSERT INTO matches(match_url_id,challenger_bot_id,challenged_bot_id,ch_code_version,cd_code_version,
     ch_code_hash,cd_code_hash,winner,reason,turns,final_challenger_pieces,final_challenged_pieces,
-    game_json,challenger_side,seed,played_at)
-  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    game_json,challenger_side,seed,played_at,battle_id,game_no)
+  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
 const stmtGetMatch = db.prepare('SELECT * FROM matches WHERE match_url_id=?');
 const stmtListBotMatches = db.prepare(`
   SELECT m.*,
@@ -199,6 +289,11 @@ module.exports = {
     return stmtGetBotByAccount.get(accountId);
   },
   getBotById: (id) => stmtGetBotById.get(id),
+  getBotByName: (name) => stmtGetBotByName.get(name),
+  searchBotsByName(q) {
+    const escaped = q.replace(/[\\%_]/g, (c) => '\\' + c);
+    return stmtSearchBots.all(`%${escaped}%`);
+  },
   getBotByAccount: (accountId) => stmtGetBotByAccount.get(accountId),
   updateBotAvatar: (botId, avatar) => stmtUpdateBotAvatar.run(avatar, botId),
   listBots: () => stmtListBots.all(),
@@ -217,23 +312,37 @@ module.exports = {
   getBotKeyInfo: (botId) => stmtGetKeyByBot.get(botId),
   getBotByApiKey: (key) => stmtGetBotByKey.get(hashKey(key)),
 
-  // 代码版本
-  submitCodeVersion(botId, version, code, notes, submittedBy) {
+  // 代码版本（先测后存：仅烟雾测试通过的代码才入库，入库即发布）
+  publishCodeVersion(botId, version, code, notes, submittedBy) {
     const hash = codeHash(code);
-    stmtInsertVersion.run(botId, version, code, hash, notes || null, submittedBy || null, 'pending', null, now());
+    db.exec('BEGIN');
+    try {
+      stmtDeleteStaleVersions.run(botId, version);
+      stmtInsertVersion.run(botId, version, code, hash, notes || null, submittedBy || null, 'passed', null, now());
+      stmtUpdateBotVersion.run(version, botId);
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
     return stmtGetVersion.get(botId, version);
-  },
-  updateSmokeStatus(botId, version, status, detail) {
-    stmtUpdateSmokeStatus.run(status, detail || null, botId, version);
-    if (status === 'passed') stmtUpdateBotVersion.run(version, botId);
   },
   getVersion: (botId, version) => stmtGetVersion.get(botId, version),
   listVersions: (botId) => stmtListVersions.all(botId),
   getLatestPassedVersion(botId) { return stmtGetCurrentCode.get(botId, 'passed'); },
 
+  // 场（一场 = 双局）
+  createBattle({ urlId: uid, challengerBotId, challengedBotId, result, chRpDelta, cdRpDelta }) {
+    const r = stmtInsertBattle.run(uid, challengerBotId, challengedBotId, result, chRpDelta, cdRpDelta, now());
+    return r.lastInsertRowid;
+  },
+  listBotBattles(botId, limit = 20) {
+    return stmtListBotBattles.all(botId, botId, limit).map((b) => ({ ...b, games: stmtBattleGames.all(b.id) }));
+  },
+
   // 对局
-  saveMatch({ urlId: uid, challengerBotId, challengedBotId, chVer, cdVer, chHash, cdHash, winner, reason, turns, finalCh, finalCd, gameJson, challengerSide, seed }) {
-    stmtInsertMatch.run(uid, challengerBotId, challengedBotId, chVer, cdVer, chHash, cdHash, winner, reason, turns, finalCh, finalCd, JSON.stringify(gameJson), challengerSide, seed, now());
+  saveMatch({ urlId: uid, challengerBotId, challengedBotId, chVer, cdVer, chHash, cdHash, winner, reason, turns, finalCh, finalCd, gameJson, challengerSide, seed, battleId, gameNo }) {
+    stmtInsertMatch.run(uid, challengerBotId, challengedBotId, chVer, cdVer, chHash, cdHash, winner, reason, turns, finalCh, finalCd, JSON.stringify(gameJson), challengerSide, seed, now(), battleId ?? null, gameNo ?? null);
     return stmtGetMatch.get(uid);
   },
   getMatch: (urlId) => stmtGetMatch.get(urlId),
@@ -250,6 +359,7 @@ module.exports = {
   updateRating(botId, newRating, newRp, wins, losses, draws) {
     stmtUpdateBotRating.run(newRating, newRp, wins, losses, draws, botId);
   },
+  recomputeBotStats,
   getBotRankPosition(botId) { const r = stmtBotRankPos.get(botId); return r ? r.pos : null; },
   eloUpdate,
 

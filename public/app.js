@@ -35,7 +35,7 @@ async function apiFetch(method, url, body) {
   json.__status = res.status;
   return json;
 }
-function esc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function esc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 let toastTimer = null;
 function toast(msg) {
   const t = $('toast'); t.textContent = msg; t.classList.remove('hidden');
@@ -143,7 +143,7 @@ async function refreshMe() {
 function renderAuthState() {
   const el = $('authState');
   if (ME && ME.account) {
-    el.innerHTML = `<span class="who">${avatarBadge()}${esc(ME.account.nickname)}</span><button class="mini" id="logoutBtn">登出</button>`;
+    el.innerHTML = `<span class="who">${esc(ME.account.nickname)}</span><button class="mini" id="logoutBtn">登出</button>`;
     $('logoutBtn').addEventListener('click', async () => { await apiFetch('POST', '/api/auth/logout'); await refreshMe(); showTab('play'); toast('已登出'); });
   } else {
     el.innerHTML = `<button class="primary mini" id="openRegisterBtn">注册</button><button class="mini" id="openLoginBtn">登录</button>`;
@@ -151,11 +151,6 @@ function renderAuthState() {
     $('openLoginBtn').addEventListener('click', () => openAuth('login'));
   }
 }
-function avatarBadge() {
-  if (!ME || !ME.bot) return '';
-  return `<span style="width:24px;height:24px;border-radius:7px;overflow:hidden;display:inline-block;vertical-align:middle">${avatarHtml(ME.bot.avatar)}</span>`;
-}
-
 // ============================================================
 // Tab 切换（含登录守卫）
 // ============================================================
@@ -186,13 +181,19 @@ function openAuth(mode) {
 $('toLogin').addEventListener('click', () => openAuth('login'));
 $('toRegister').addEventListener('click', () => openAuth('register'));
 
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 function validateRegister() {
   const pw = $('reg-pw').value, pw2 = $('reg-pw2').value;
+  const email = $('reg-email').value.trim();
+  const errEmail = $('err-email');
+  const emailOk = EMAIL_RE.test(email);
+  if (email && !emailOk) { errEmail.textContent = '邮箱格式不正确'; errEmail.classList.remove('ok'); }
+  else { errEmail.textContent = ''; }
   const errEl = $('err-pw2');
   if (pw2 && pw !== pw2) { errEl.textContent = '两次密码不一致'; errEl.classList.remove('ok'); }
   else if (pw2 && pw === pw2) { errEl.textContent = '密码一致 ✓'; errEl.classList.add('ok'); }
   else { errEl.textContent = ''; }
-  const ready = $('reg-nick').value.trim() && $('reg-email').value.trim() && pw.length >= 8 && pw === pw2;
+  const ready = $('reg-nick').value.trim() && emailOk && pw.length >= 8 && pw === pw2;
   $('regBtn').disabled = !ready;
 }
 ['reg-nick','reg-email','reg-pw','reg-pw2'].forEach((id) => $(id).addEventListener('input', () => { validateRegister(); if (id === 'reg-nick') $('err-nick').textContent = ''; }));
@@ -284,9 +285,26 @@ async function onPickPreset(n) {
   }
 }
 
+// 棋手名实时查重（创建前检查名称是否已被占用）
+let nameCheckTimer = null;
+$('bot-name').addEventListener('input', () => {
+  const errEl = $('err-botname');
+  errEl.textContent = ''; errEl.classList.remove('ok');
+  clearTimeout(nameCheckTimer);
+  const name = $('bot-name').value.trim();
+  if (!name) return;
+  nameCheckTimer = setTimeout(async () => {
+    const r = await apiFetch('GET', '/api/bot/name-check?name=' + encodeURIComponent(name));
+    if (name !== $('bot-name').value.trim()) return; // 输入已变化，丢弃过期结果
+    if (!r.ok) return;
+    if (r.available) { errEl.textContent = '名称可用 ✓'; errEl.classList.add('ok'); }
+    else { errEl.textContent = '该名称已被其他棋手占用，换一个吧'; }
+  }, 350);
+});
+
 function openCreateBot() {
   avatarMode = 'create'; selectedAvatar = 'preset:1'; pendingUploadDataUrl = null;
-  $('bot-name').value = ''; $('err-botname').textContent = '';
+  $('bot-name').value = ''; $('err-botname').textContent = ''; $('err-botname').classList.remove('ok');
   $('bot-name').closest('.field').classList.remove('hidden');
   $('createBotBtn').classList.remove('hidden');
   document.querySelector('#createBotModal h2').textContent = '创建棋手';
@@ -304,9 +322,12 @@ function openAvatarEditor() {
 $('createBotBtn').addEventListener('click', async () => {
   const name = $('bot-name').value.trim();
   if (!name) { $('err-botname').textContent = '请填写棋手名称'; return; }
+  // 提交前再查一次占用，避免输入后未触发防抖检查就直接提交
+  const chk = await apiFetch('GET', '/api/bot/name-check?name=' + encodeURIComponent(name));
+  if (chk.ok && !chk.available) { $('err-botname').classList.remove('ok'); $('err-botname').textContent = '该名称已被其他棋手占用，换一个吧'; return; }
   const presetForCreate = selectedAvatar === 'upload' ? 'preset:1' : selectedAvatar;
   const r = await apiFetch('POST', '/api/bot/create', { name, avatar: presetForCreate });
-  if (!r.ok) { $('err-botname').textContent = r.error || '创建失败'; return; }
+  if (!r.ok) { $('err-botname').classList.remove('ok'); $('err-botname').textContent = r.error || '创建失败'; return; }
   if (pendingUploadDataUrl) await apiFetch('POST', '/api/bot/me/avatar', { dataUrl: pendingUploadDataUrl });
   closeModal('createBotModal'); await refreshMe(); showDetail(); toast('棋手已创建');
 });
@@ -443,25 +464,39 @@ async function viewCode(version) {
   $('codeCopy').onclick = () => copyText(r.version.code, '已复制');
   openModal('codeModal');
 }
+// ---- 对战列表（按场展示，我的详情页 / 公开详情页共用）----
+const RES_LABEL = { win: '胜', loss: '负', draw: '平' };
+const RES_CLS = { win: 'passed', loss: 'failed', draw: 'pending' };
+function battleCardHtml(b) {
+  const rp = b.rpDelta == null
+    ? '<span class="rp-delta">RP —</span>'
+    : `<span class="rp-delta ${b.rpDelta >= 0 ? 'up' : 'down'}">RP ${b.rpDelta >= 0 ? '+' : ''}${b.rpDelta}</span>`;
+  const games = b.games.map((g) =>
+    `<span class="game-pill ${RES_CLS[g.result]}">第${g.gameNo}局·执${g.mySide === 'black' ? '黑' : '红'} ${RES_LABEL[g.result]}</span>`
+  ).join('');
+  return `<div class="match-row">
+    <span class="chip ${RES_CLS[b.result]}">${RES_LABEL[b.result]}</span>
+    <div class="grow">
+      <b>vs ${esc(b.opponentName)}</b> ${rp}
+      <div class="game-pills">${games}</div>
+      <div class="vmeta">${new Date(b.playedAt).toLocaleString()}</div>
+    </div>
+    <button class="mini" data-battle="${esc(b.battleUrlId)}">回放</button>
+  </div>`;
+}
+function bindBattleReplays(root, battles) {
+  root.querySelectorAll('[data-battle]').forEach((btn) => btn.addEventListener('click', () => {
+    const b = battles.find((x) => x.battleUrlId === btn.dataset.battle);
+    if (b) openBattleReplay(b);
+  }));
+}
 async function loadMyMatches() {
   const box = $('subBody'); box.innerHTML = '<div class="muted-center">加载中…</div>';
   const r = await apiFetch('GET', '/api/bot/me/matches');
   if (!r.ok) { box.innerHTML = `<div class="muted-center">${esc(r.error)}</div>`; return; }
-  if (!r.matches.length) { box.innerHTML = '<div class="muted-center">还没有正式对战记录。</div>'; return; }
-  const mine = r.myBotId;
-  box.innerHTML = r.matches.map((m) => {
-    const iAmCh = m.challenger_bot_id === mine;
-    const opp = iAmCh ? m.challenged_name : m.challenger_name;
-    const meWon = (m.winner === 'challenger' && iAmCh) || (m.winner === 'challenged' && !iAmCh);
-    const res = m.winner === 'draw' ? '平' : (meWon ? '胜' : '负');
-    const cls = m.winner === 'draw' ? 'pending' : (meWon ? 'passed' : 'failed');
-    return `<div class="match-row">
-      <span class="chip ${cls}">${res}</span>
-      <div class="grow"><b>vs ${esc(opp)}</b><div class="vmeta">${REASON_LABEL[m.reason] || m.reason} · ${m.turns} 手 · ${new Date(m.played_at).toLocaleString()}</div></div>
-      <button class="mini" data-url="${m.match_url_id}">回放</button>
-    </div>`;
-  }).join('');
-  box.querySelectorAll('[data-url]').forEach((b) => b.addEventListener('click', () => replaySavedMatch(b.dataset.url)));
+  if (!r.battles.length) { box.innerHTML = '<div class="muted-center">还没有正式对战记录。</div>'; return; }
+  box.innerHTML = r.battles.map(battleCardHtml).join('');
+  bindBattleReplays(box, r.battles);
 }
 
 // ============================================================
@@ -476,7 +511,7 @@ async function showPublicBot(botId) {
   ]);
   if (!info.ok) { box.innerHTML = `<div class="muted-center">${esc(info.error)}</div>`; return; }
   const b = info.bot;
-  const matches = ms.ok ? ms.matches : [];
+  const battles = ms.ok ? ms.battles : [];
   box.innerHTML = `
     <div class="detail-head">
       <div class="av">${avatarHtml(b.avatar)}</div>
@@ -497,25 +532,15 @@ async function showPublicBot(botId) {
         <div class="ov-row"><span>当前版本</span><b>v${b.currentVersion}</b></div>
       </div>
       <div class="card">
-        <h3>最近对战（${matches.length}）</h3>
-        <div id="pubMatches">${matches.length ? '' : '<div class="muted-center">还没有正式对战记录。</div>'}</div>
+        <h3>最近对战（${battles.length}）</h3>
+        <div id="pubMatches">${battles.length ? '' : '<div class="muted-center">还没有正式对战记录。</div>'}</div>
       </div>
     </div>`;
   $('backToLb').addEventListener('click', () => showTab('leaderboard'));
   const list = $('pubMatches');
-  if (matches.length) {
-    list.innerHTML = matches.map((m) => {
-      const opp = m.isChallenger ? m.challengedName : m.challengerName;
-      const won = (m.winner === 'challenger' && m.isChallenger) || (m.winner === 'challenged' && !m.isChallenger);
-      const res = m.winner === 'draw' ? '平' : (won ? '胜' : '负');
-      const cls = m.winner === 'draw' ? 'pending' : (won ? 'passed' : 'failed');
-      return `<div class="match-row" style="box-shadow:none;border:1.5px solid var(--line);margin-bottom:8px">
-        <span class="chip ${cls}">${res}</span>
-        <div class="grow"><b>vs ${esc(opp)}</b><div class="vmeta">${REASON_LABEL[m.reason] || m.reason} · ${m.turns} 手 · ${new Date(m.playedAt).toLocaleString()}</div></div>
-        <button class="mini" data-url="${m.matchUrlId}">回放</button>
-      </div>`;
-    }).join('');
-    list.querySelectorAll('[data-url]').forEach((btn) => btn.addEventListener('click', () => replaySavedMatch(btn.dataset.url)));
+  if (battles.length) {
+    list.innerHTML = battles.map(battleCardHtml).join('');
+    bindBattleReplays(list, battles);
   }
 }
 
@@ -617,18 +642,34 @@ function nextSideToMove(){
 }
 function updateStatusLine(){
   const banner=$('resultBanner');
-  if(!play.started){banner.className='result-banner hidden';$('statusLine').textContent='选择对手与执方，点击「开始对局」试玩';return;}
+  if(!play.started){
+    banner.className='result-banner hidden';
+    $('statusLine').textContent=play.mode==='local'
+      ?'两位玩家同屏交替走子，点击「开始对局」'
+      :'选择对手与执方，点击「开始对局」试玩';
+    return;
+  }
   if(play.over){
     const m=state.match;
     const who=m.winner==='draw'?'和棋':`${SIDE_LABEL[m.winner]}（${m.winner==='black'?m.blackName:m.redName}）胜`;
-    const youWon=m.winner===play.humanSide;
-    banner.className='result-banner '+(m.winner==='draw'?'':(youWon?'win':''));
-    banner.innerHTML=`${m.winner==='draw'?'和棋':(youWon?'🎉 你赢了！':'你输了')}<small>${REASON_LABEL[m.reason]||m.reason} · 共 ${m.turns} 手</small>`;
+    if(play.mode==='local'){
+      banner.className='result-banner '+(m.winner==='draw'?'':'win');
+      banner.innerHTML=`${m.winner==='draw'?'和棋':`🏆 ${esc(m.winner==='black'?m.blackName:m.redName)} 获胜！`}<small>${REASON_LABEL[m.reason]||m.reason} · 共 ${m.turns} 手</small>`;
+    }else{
+      const youWon=m.winner===play.humanSide;
+      banner.className='result-banner '+(m.winner==='draw'?'':(youWon?'win':''));
+      banner.innerHTML=`${m.winner==='draw'?'和棋':(youWon?'🎉 你赢了！':'你输了')}<small>${REASON_LABEL[m.reason]||m.reason} · 共 ${m.turns} 手</small>`;
+    }
     $('statusLine').textContent=`终局：${who}`;
     return;
   }
   banner.className='result-banner hidden';
-  $('statusLine').textContent=play.sel?'点击高亮格完成走子，或点其他己方棋子换选':'轮到你走子：点击你的棋子';
+  if(play.mode==='local'){
+    const nm=play.toMove==='black'?play.p1:play.p2;
+    $('statusLine').textContent=play.sel?'点击高亮格完成走子，或点其他棋子换选':`轮到 ${SIDE_LABEL[play.toMove]||''} · ${nm}：点击棋子走子`;
+  }else{
+    $('statusLine').textContent=play.sel?'点击高亮格完成走子，或点其他己方棋子换选':'轮到你走子：点击你的棋子';
+  }
 }
 function renderMoveList(){
   const ol=$('moveList');ol.innerHTML='';
@@ -648,18 +689,48 @@ function moveLiHtml(h,i){
 }
 
 // ============================================================
-// 人机试玩
+// 试玩（挑战棋手 / 双人同屏 两个子界面共用棋盘与状态机）
+// mode:'ai' 对战内置机器人或玩家棋手；mode:'local' 双人同屏（轮到谁 humanSide 就是谁）
+// opp: { type:'builtin'|'bot', name, botId? }
 // ============================================================
-const play = { started:false, over:false, template:null, humanSide:'black', toMove:null, history:[], legal:[], sel:null, undosLeft:3, busy:false, resultShown:false };
+const play = { started:false, over:false, mode:'ai', opp:null, humanSide:'black', toMove:null, history:[], legal:[], sel:null, undosLeft:3, busy:false, resultShown:false, p1:'玩家 1', p2:'玩家 2' };
+
+// ---- 试玩子页签切换（切换即重置当前对局）----
+document.querySelectorAll('[data-playmode]').forEach((btn) => btn.addEventListener('click', () => {
+  const m = btn.dataset.playmode;
+  if (m === play.mode) return;
+  play.mode = m;
+  document.querySelectorAll('[data-playmode]').forEach((x) => x.classList.toggle('active', x.dataset.playmode === m));
+  $('playControls').classList.toggle('hidden', m !== 'ai');
+  $('localControls').classList.toggle('hidden', m !== 'local');
+  resetPlayBoard();
+}));
+function resetPlayBoard() {
+  play.started = false; play.over = false; play.busy = false;
+  play.history = []; play.legal = []; play.sel = null; play.resultShown = false;
+  state.match = null; state.frames = buildFrames(initialBoard(), []); state.cur = 0;
+  renderMoveList(); renderFrame(); updateUndoBtn();
+  $('infoBlackName').innerHTML = `${miniIcon('black')} 黑方`;
+  $('infoRedName').innerHTML = `${miniIcon('red')} 红方`;
+}
 
 // ---- 终局弹窗动画 ----
 function showResultOverlay() {
   const m = state.match; if (!m || !m.winner) return;
   const draw = m.winner === 'draw';
-  const win = m.winner === play.humanSide;
-  $('rpEmoji').textContent = draw ? '🤝' : (win ? '🎉' : '🌊');
-  $('rpTitle').textContent = draw ? '和棋' : (win ? '胜利！' : '惜败');
-  $('rpSub').textContent = `${REASON_LABEL[m.reason] || m.reason} · 共 ${m.turns} 手 · 对手「${play.template}」`;
+  let win;
+  if (play.mode === 'local') {
+    win = !draw; // 双人同屏：有人赢就撒彩带
+    const winnerName = m.winner === 'black' ? m.blackName : m.redName;
+    $('rpEmoji').textContent = draw ? '🤝' : '🏆';
+    $('rpTitle').textContent = draw ? '和棋' : `${winnerName} 获胜！`;
+    $('rpSub').textContent = `${REASON_LABEL[m.reason] || m.reason} · 共 ${m.turns} 手`;
+  } else {
+    win = m.winner === play.humanSide;
+    $('rpEmoji').textContent = draw ? '🤝' : (win ? '🎉' : '🌊');
+    $('rpTitle').textContent = draw ? '和棋' : (win ? '胜利！' : '惜败');
+    $('rpSub').textContent = `${REASON_LABEL[m.reason] || m.reason} · 共 ${m.turns} 手 · 对手「${play.opp ? play.opp.name : ''}」`;
+  }
   $('resultPop').className = 'result-pop ' + (draw ? 'draw' : (win ? 'win' : 'loss'));
   const box = $('confettiBox'); box.innerHTML = '';
   if (win) { // 胜利撒彩带
@@ -682,13 +753,14 @@ function maybeShowResult() {
     setTimeout(showResultOverlay, 420); // 等最后一帧落子动画
   }
 }
-$('rpAgain').addEventListener('click', () => { closeModal('resultOverlay'); startPlay(); });
+$('rpAgain').addEventListener('click', () => { closeModal('resultOverlay'); play.mode === 'local' ? startLocalPlay() : startPlay(); });
 $('rpClose').addEventListener('click', () => closeModal('resultOverlay'));
 
 function updateUndoBtn(){
   $('undoBtn').textContent=`悔棋（剩 ${play.undosLeft} 次）`;
   const hasHumanMove=play.history.some((h)=>h.side===play.humanSide&&!h.pass);
-  $('undoBtn').disabled=!play.started||play.busy||play.undosLeft<=0||!hasHumanMove;
+  $('undoBtn').disabled=play.mode!=='ai'||!play.started||play.busy||play.undosLeft<=0||!hasHumanMove;
+  $('undoLocalBtn').disabled=play.mode!=='local'||!play.started||play.busy||!play.history.some((h)=>!h.pass);
 }
 function paintPlayHints(){
   if(!play.started||play.over||play.busy)return;
@@ -702,19 +774,29 @@ function paintPlayHints(){
 async function postPlay(history,{animate}={}){
   play.busy=true;updateUndoBtn();
   const prevFrames=state.frames.length;
-  const r=await apiFetch('POST','/api/play',{template:play.template,humanSide:play.humanSide,history});
+  const payload=play.mode==='local'
+    ?{mode:'local',history}
+    :{humanSide:play.humanSide,history,...(play.opp.type==='bot'?{botId:play.opp.botId}:{template:play.opp.name})};
+  const r=await apiFetch('POST','/api/play',payload);
   if(!r.ok){play.busy=false;updateUndoBtn();toast(r.error||'走子失败');return null;}
   play.history=r.history;
   play.legal=r.legalMoves;
   play.over=r.status.over;
-  play.toMove=play.over?null:play.humanSide;
+  if(play.mode==='local'){
+    play.toMove=r.toMove;
+    if(r.toMove)play.humanSide=r.toMove; // 同屏：轮到谁，谁就是「人类执方」
+  }else{
+    play.toMove=play.over?null:play.humanSide;
+  }
   play.sel=null;
-  state.match={
-    blackName:play.humanSide==='black'?'你':play.template,
-    redName:play.humanSide==='red'?'你':play.template,
-    winner:r.status.winner,reason:r.status.reason,turns:r.status.turns,
-    history:r.history,
-  };
+  state.match=play.mode==='local'
+    ?{blackName:play.p1,redName:play.p2,winner:r.status.winner,reason:r.status.reason,turns:r.status.turns,history:r.history}
+    :{
+      blackName:play.humanSide==='black'?'你':play.opp.name,
+      redName:play.humanSide==='red'?'你':play.opp.name,
+      winner:r.status.winner,reason:r.status.reason,turns:r.status.turns,
+      history:r.history,
+    };
   state.frames=buildFrames(r.initialBoard,r.history);
   renderMoveList();
   if(animate&&state.frames.length>prevFrames&&prevFrames>0){
@@ -733,12 +815,30 @@ async function postPlay(history,{animate}={}){
   return r;
 }
 async function startPlay(){
-  play.started=true;play.over=false;play.template=$('oppSel').value;play.humanSide=$('sideSel').value;
+  const sel=$('oppSel');
+  if(!sel.value)return toast('请先选择对手');
+  const opt=sel.options[sel.selectedIndex];
+  play.opp=sel.value.startsWith('bot:')
+    ?{type:'bot',botId:+sel.value.slice(4),name:opt.dataset.name||opt.textContent}
+    :{type:'builtin',name:sel.value};
+  play.mode='ai';play.started=true;play.over=false;play.humanSide=$('sideSel').value;
   play.history=[];play.legal=[];play.sel=null;play.undosLeft=3;play.busy=false;play.resultShown=false;
   state.match=null;state.frames=[];state.cur=0;
   $('statusLine').textContent='对局开始…';
-  await postPlay([]);
-  toast(`对局开始：你执${play.humanSide==='black'?'梭子蟹（黑方 · 先手）':'龙虾（红方 · 后手）'}，对手「${play.template}」`);
+  const r=await postPlay([]);
+  if(!r){play.started=false;updateUndoBtn();return;}
+  toast(`对局开始：你执${play.humanSide==='black'?'梭子蟹（黑方 · 先手）':'龙虾（红方 · 后手）'}，对手「${play.opp.name}」`);
+}
+async function startLocalPlay(){
+  play.mode='local';play.started=true;play.over=false;play.opp=null;
+  play.p1=$('p1Name').value.trim()||'玩家 1';
+  play.p2=$('p2Name').value.trim()||'玩家 2';
+  play.history=[];play.legal=[];play.sel=null;play.busy=false;play.resultShown=false;
+  state.match=null;state.frames=[];state.cur=0;
+  $('statusLine').textContent='对局开始…';
+  const r=await postPlay([]);
+  if(!r){play.started=false;updateUndoBtn();return;}
+  toast(`对局开始：${play.p1} 执梭子蟹（黑方）先行，${play.p2} 执龙虾（红方）`);
 }
 function onCellClick(x,y){
   if(!play.started||play.over||play.busy)return;
@@ -769,8 +869,71 @@ async function undoMove(){
   await postPlay(truncated);
   toast(`已悔棋（剩 ${play.undosLeft} 次）`);
 }
+// 双人同屏悔棋：撤销最后一步实际走子（不限次数，双方协商使用）
+async function undoLocal(){
+  if(!play.started||play.busy)return;
+  let last=-1;
+  for(let i=play.history.length-1;i>=0;i--){
+    if(!play.history[i].pass){last=i;break;}
+  }
+  if(last<0)return toast('还没有可悔的着法');
+  play.over=false;play.resultShown=false;closeModal('resultOverlay');
+  const truncated=play.history.slice(0,last).map((h)=>({side:h.side,from:h.from,to:h.to,pass:h.pass}));
+  await postPlay(truncated);
+  toast('已悔一手');
+}
 $('startPlayBtn').addEventListener('click',startPlay);
 $('undoBtn').addEventListener('click',undoMove);
+$('startLocalBtn').addEventListener('click',startLocalPlay);
+$('undoLocalBtn').addEventListener('click',undoLocal);
+
+// ============================================================
+// 玩家棋手搜索（挑战棋手子界面）
+// ============================================================
+let botSearchTimer=null;
+$('botSearch').addEventListener('input',()=>{
+  clearTimeout(botSearchTimer);
+  const q=$('botSearch').value.trim();
+  if(!q){hideBotSearch();return;}
+  botSearchTimer=setTimeout(doBotSearch,300);
+});
+async function doBotSearch(){
+  const q=$('botSearch').value.trim();
+  if(!q)return;
+  const r=await apiFetch('GET','/api/bots/search?q='+encodeURIComponent(q));
+  if(q!==$('botSearch').value.trim())return; // 输入已变化，丢弃过期结果
+  if(!r.ok)return;
+  const box=$('botSearchResults');
+  if(!r.bots.length){
+    box.innerHTML='<div class="search-empty">没有找到匹配的棋手</div>';
+    box.classList.remove('hidden');
+    return;
+  }
+  box.innerHTML=r.bots.map((b)=>`
+    <div class="search-item${b.playable?'':' disabled'}" data-id="${b.botId}" data-name="${esc(b.name)}">
+      <span class="s-av">${avatarHtml(b.avatar)}</span>
+      <span class="s-info"><b>${esc(b.name)}</b><small>${esc(b.ownerNickname)} · ${esc(b.rank)}</small></span>
+      <span class="s-tag">${b.playable?'可挑战':'空脚本'}</span>
+    </div>`).join('');
+  box.classList.remove('hidden');
+  box.querySelectorAll('.search-item:not(.disabled)').forEach((el)=>el.addEventListener('click',()=>selectPlayerBot(+el.dataset.id,el.dataset.name)));
+}
+function selectPlayerBot(botId,name){
+  const sel=$('oppSel');
+  let og=sel.querySelector('optgroup[label="玩家棋手"]');
+  if(!og){og=document.createElement('optgroup');og.label='玩家棋手';sel.appendChild(og);}
+  let opt=og.querySelector(`option[value="bot:${botId}"]`);
+  if(!opt){
+    opt=document.createElement('option');
+    opt.value='bot:'+botId;opt.dataset.name=name;opt.textContent=`${name}（玩家棋手）`;
+    og.appendChild(opt);
+  }
+  sel.value='bot:'+botId;
+  $('botSearch').value='';hideBotSearch();
+  toast(`已选择对手「${name}」，点击「开始对局」`);
+}
+function hideBotSearch(){$('botSearchResults').classList.add('hidden');$('botSearchResults').innerHTML='';}
+document.addEventListener('click',(e)=>{if(!e.target.closest('.search-box'))hideBotSearch();});
 
 // ============================================================
 // 对局回放（正式对局 · 独立弹窗，与试玩棋盘完全隔离）
@@ -836,8 +999,31 @@ function rRenderMoveList(){
     ol.appendChild(li);
   });
 }
-async function replaySavedMatch(urlId) {
-  const r = await apiFetch('GET', '/api/match/' + urlId);
+// 一场两局：弹窗顶部 tab 切换查看每局棋谱
+const battleReplay = { games: [], cur: 0 };
+function openBattleReplay(battle) {
+  battleReplay.games = battle.games || [];
+  battleReplay.cur = 0;
+  renderReplayTabs();
+  loadReplayGame(0);
+}
+function renderReplayTabs() {
+  const box = $('rGameTabs');
+  if (battleReplay.games.length < 2) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+  box.classList.remove('hidden');
+  box.innerHTML = battleReplay.games.map((g, i) =>
+    `<button class="game-tab${i === battleReplay.cur ? ' active' : ''}" data-g="${i}">第 ${g.gameNo} 局 · ${RES_LABEL[g.result]}</button>`
+  ).join('');
+  box.querySelectorAll('[data-g]').forEach((btn) => btn.addEventListener('click', () => {
+    const i = +btn.dataset.g;
+    if (i === battleReplay.cur) return;
+    battleReplay.cur = i; renderReplayTabs(); loadReplayGame(i);
+  }));
+}
+async function loadReplayGame(idx) {
+  const g = battleReplay.games[idx];
+  if (!g) return;
+  const r = await apiFetch('GET', '/api/match/' + g.matchUrlId);
   if (!r.ok) return toast(r.error || '加载失败');
   // 挑战双方执方由 challenger_side 决定（第 2 局挑战者执红）
   const chSide = r.challenger_side === 'red' ? 'red' : 'black';
@@ -847,7 +1033,7 @@ async function replaySavedMatch(urlId) {
   rstate.match = { blackName: names.black, redName: names.red, winnerSide, reason: r.reason, turns: r.turns, history: r.gameData.history };
   rstate.frames = buildFrames(r.gameData.initialBoard, r.gameData.history);
   rstate.cur = 0; rPause();
-  $('replayTitle').textContent = `对局回放 · ${names.black} vs ${names.red}`;
+  $('replayTitle').textContent = `对局回放 · ${names.black} vs ${names.red} · 第 ${g.gameNo} 局`;
   $('rBlackName').innerHTML = `${miniIcon('black')} ${esc(names.black || '黑方')}`;
   $('rRedName').innerHTML = `${miniIcon('red')} ${esc(names.red || '红方')}`;
   rRenderMoveList(); rRenderFrame();
