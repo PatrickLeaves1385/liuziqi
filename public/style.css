@@ -24,7 +24,8 @@ a:hover { text-decoration:underline; }
 .topbar { display:flex; align-items:center; gap:18px; padding:10px 24px; background:rgba(255,255,255,.62); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px); box-shadow:0 2px 12px rgba(31,112,160,.12); flex-wrap:wrap; position:sticky; top:0; z-index:20; }
 .brand { display:flex; align-items:center; gap:10px; }
 .brand-mark { font-size:26px; }
-.brand-text h1 { margin:0; font-size:20px; line-height:1; }
+.brand-text h1 { margin:0; font-size:20px; line-height:1; display:flex; align-items:baseline; gap:8px; }
+.brand-en { font-size:13px; font-weight:700; letter-spacing:1px; color:var(--mint-dp); font-style:italic; }
 .brand-sub { font-size:10px; letter-spacing:2px; color:var(--mint-dp); font-weight:600; }
 .tabs { display:flex; gap:4px; margin-left:10px; flex-wrap:wrap; }
 .tab { background:transparent; border:none; color:var(--muted); padding:8px 14px; font-size:14px; font-weight:600; cursor:pointer; border-radius:999px; transition:.15s; font-family:inherit; }
@@ -100,7 +101,9 @@ select:focus,input:focus,textarea:focus { outline:none; border-color:var(--mint)
 .info-card.black-side { border-top:4px solid var(--black); }
 .info-card.red-side { border-top:4px solid var(--red); }
 .info-card.active { border-color:var(--mint); }
-.side-name { color:var(--muted); font-size:13px; margin-bottom:6px; font-weight:600; }
+.side-name { color:var(--muted); font-size:13px; margin-bottom:6px; font-weight:600; display:flex; align-items:center; justify-content:center; gap:6px; }
+.side-name .r-av { width:24px; height:24px; border-radius:7px; overflow:hidden; flex:0 0 auto; }
+.side-name .r-av svg, .side-name .r-av img { width:100%; height:100%; display:block; object-fit:cover; }
 .side-count { font-size:30px; font-weight:700; }
 .side-count small { font-size:13px; color:var(--muted); font-weight:500; margin-left:2px; }
 .meta-line { display:flex; justify-content:space-between; color:var(--muted); font-size:13px; padding:0 4px 8px; }
@@ -189,6 +192,8 @@ select:focus,input:focus,textarea:focus { outline:none; border-color:var(--mint)
 .ver-row,.match-row { display:flex; align-items:center; gap:12px; background:var(--card); border-radius:14px; padding:12px 16px; box-shadow:var(--shadow); margin-bottom:10px; flex-wrap:wrap; }
 .ver-row .grow,.match-row .grow { flex:1; min-width:160px; }
 .ver-row .vmeta,.match-row .vmeta { color:var(--muted); font-size:12px; margin-top:3px; }
+.match-row .m-av { width:34px; height:34px; border-radius:10px; overflow:hidden; flex:0 0 auto; }
+.match-row .m-av svg, .match-row .m-av img { width:100%; height:100%; display:block; object-fit:cover; }
 
 /* ---- 对战列表：场卡片 ---- */
 .game-pills { display:flex; gap:6px; margin-top:6px; flex-wrap:wrap; }
@@ -228,6 +233,8 @@ select:focus,input:focus,textarea:focus { outline:none; border-color:var(--mint)
 .modal-narrow { width:340px; text-align:center; }
 .modal-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; }
 .modal-head h2 { margin:0; font-size:18px; }
+#replayTitle .t-av { display:inline-flex; width:22px; height:22px; border-radius:6px; overflow:hidden; vertical-align:-5px; margin-right:4px; }
+#replayTitle .t-av svg, #replayTitle .t-av img { width:100%; height:100%; object-fit:cover; }
 .modal-sub { color:var(--muted); font-size:13px; margin:0 0 16px; }
 .modal-foot { text-align:center; color:var(--muted); font-size:13px; margin:14px 0 0; }
 .code-view { background:var(--sky); border-radius:12px; padding:14px; overflow:auto; max-height:60vh; font-size:13px; line-height:1.6; }

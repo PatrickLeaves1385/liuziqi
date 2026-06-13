@@ -103,17 +103,29 @@ function maskKey(key) {
 }
 
 // ---- 段位分 RP ----
-// 每场（双局合计定胜负）：胜 +25 / 平 +10 / 负 −15，胜负附 ELO 差修正 ±10（打强者多得、输给弱者多扣）
-function rpDelta(result, myElo, oppElo) {
-  const corr = Math.max(-10, Math.min(10, Math.round((oppElo - myElo) / 40)));
-  if (result === 'win') return 25 + corr;
-  if (result === 'loss') return -15 + corr;
-  return 10;
-}
 const RANK_TIERS = ['青铜', '白银', '黄金', '钻石', '王者'];
+// 小段序号 0..14（青铜III=0 … 王者I=14），每小段 100 RP
+function smallTierIndex(rp) {
+  return Math.min(14, Math.floor(Math.max(0, rp) / 100));
+}
+// 大段序号 0..4（青铜=0 / 白银=1 / 黄金=2 / 钻石=3 / 王者=4）
+function bigTierIndex(rp) {
+  return Math.floor(smallTierIndex(rp) / 3);
+}
 function rankLabel(rp) {
-  const idx = Math.min(14, Math.floor(Math.max(0, rp) / 100));
+  const idx = smallTierIndex(rp);
   return `${RANK_TIERS[Math.floor(idx / 3)]} ${['III', 'II', 'I'][idx % 3]}`;
+}
+// 每场（双局合计定胜负）只计一次。修正项按「大段位差」放大，不再用内部 ELO：
+//   d = 对手大段位 − 本方大段位（−4..4），STEP=8 同时作用于胜/负，平局用半步（4）。
+//   保号夹取防刷分：胜 ∈ [+3,+50]、负 ∈ [−50,−3]、平 ∈ [0,+20]。
+//   同大段位 d=0 → 回到基准 +25 / +10 / −15。战胜强者多得、输给强者少扣、战胜弱者少得、输给弱者多扣。
+function rpDelta(result, myRp, oppRp) {
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const d = bigTierIndex(oppRp) - bigTierIndex(myRp);
+  if (result === 'win') return clamp(25 + 8 * d, 3, 50);
+  if (result === 'loss') return clamp(-15 + 8 * d, -50, -3);
+  return clamp(10 + 4 * d, 0, 20);
 }
 
 // ---- 头像 dataURL 校验：类型 PNG/JPEG、≤100KB、1:1 正方形 ----
@@ -545,6 +557,7 @@ function battleView(b, botId) {
   return {
     battleUrlId: b.battle_url_id, playedAt: b.played_at,
     opponentName: isCh ? b.challenged_name : b.challenger_name,
+    opponentAvatar: isCh ? b.challenged_avatar : b.challenger_avatar,
     result: persp(b.result),
     rpDelta: isCh ? b.ch_rp_delta : b.cd_rp_delta,
     games: b.games.map((g) => ({
@@ -707,11 +720,11 @@ route('POST', '/api/agent/challenge', (req, res, _m, body) => {
   const newChRating = db.eloUpdate(challenger.rating, challenged.rating, chFrac);
   const newCdRating = db.eloUpdate(challenged.rating, challenger.rating, 1 - chFrac);
 
-  // 段位分 RP 更新（双局合计定本场胜负；修正用赛前 ELO）
+  // 段位分 RP 更新（双局合计定本场胜负；修正按赛前大段位差）
   const chResult = chScore > cdScore ? 'win' : chScore < cdScore ? 'loss' : 'draw';
   const cdResult = chResult === 'win' ? 'loss' : chResult === 'loss' ? 'win' : 'draw';
-  const newChRp = Math.max(0, challenger.rp + rpDelta(chResult, challenger.rating, challenged.rating));
-  const newCdRp = Math.max(0, challenged.rp + rpDelta(cdResult, challenged.rating, challenger.rating));
+  const newChRp = Math.max(0, challenger.rp + rpDelta(chResult, challenger.rp, challenged.rp));
+  const newCdRp = Math.max(0, challenged.rp + rpDelta(cdResult, challenged.rp, challenger.rp));
   // 战绩按场计：本场胜/负/平各 +1
   const inc = (r) => [r === 'win' ? 1 : 0, r === 'loss' ? 1 : 0, r === 'draw' ? 1 : 0];
   db.updateRating(challenger.id, newChRating, newChRp, ...inc(chResult));
@@ -812,7 +825,7 @@ route('GET', /^\/api\/match\/([a-z0-9]+)$/, (req, res, match) => {
   const gameJson = JSON.parse(row.game_json);
   const chBot = db.getBotById(row.challenger_bot_id);
   const cdBot = db.getBotById(row.challenged_bot_id);
-  sendJson(res, 200, { ok: true, ...row, game_json: undefined, gameData: gameJson, challengerName: chBot?.name, challengedName: cdBot?.name });
+  sendJson(res, 200, { ok: true, ...row, game_json: undefined, gameData: gameJson, challengerName: chBot?.name, challengedName: cdBot?.name, challengerAvatar: chBot?.avatar, challengedAvatar: cdBot?.avatar });
 });
 
 // ============================================================
@@ -922,7 +935,7 @@ const AGENT_GUIDE_MD = `# 钳王争霸 Agent 指南
 ## 正式挑战与段位分
 
 - 双局制（执黑、执红各 1），双局合计定本场胜负。
-- 段位分 RP：胜 +25 / 平 +10 / 负 −15，按双方内部实力分差再修正 ±10（战胜强者多得）。RP 不低于 0。
+- 段位分 RP：同大段位 胜 +25 / 平 +10 / 负 −15；跨大段位按段位差 d（对手大段 − 本方大段，每差一段 ±8、平局 ±4）修正——战胜强者多得、输给强者少扣、战胜弱者少得、输给弱者多扣。保号夹取：胜 ∈ [+3,+50]、负 ∈ [−50,−3]、平 ∈ [0,+20]，RP 不低于 0。
 - 段位：青铜/白银/黄金/钻石/王者 五大段 × III/II/I 三小段，每小段 100 RP（青铜III 从 0 起）。
 - 哈希对计分资格按代码哈希判定：同一对代码哈希的重复挑战收益受限；回滚不重置已消耗资格。
 

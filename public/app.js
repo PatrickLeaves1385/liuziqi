@@ -476,6 +476,7 @@ function battleCardHtml(b) {
   ).join('');
   return `<div class="match-row">
     <span class="chip ${RES_CLS[b.result]}">${RES_LABEL[b.result]}</span>
+    <span class="m-av">${avatarHtml(b.opponentAvatar)}</span>
     <div class="grow">
       <b>vs ${esc(b.opponentName)}</b> ${rp}
       <div class="game-pills">${games}</div>
@@ -1029,13 +1030,14 @@ async function loadReplayGame(idx) {
   const chSide = r.challenger_side === 'red' ? 'red' : 'black';
   const cdSide = chSide === 'black' ? 'red' : 'black';
   const names = { [chSide]: r.challengerName, [cdSide]: r.challengedName };
+  const avatars = { [chSide]: r.challengerAvatar, [cdSide]: r.challengedAvatar };
   const winnerSide = r.winner === 'draw' ? 'draw' : (r.winner === 'challenger' ? chSide : cdSide);
   rstate.match = { blackName: names.black, redName: names.red, winnerSide, reason: r.reason, turns: r.turns, history: r.gameData.history };
   rstate.frames = buildFrames(r.gameData.initialBoard, r.gameData.history);
   rstate.cur = 0; rPause();
-  $('replayTitle').textContent = `对局回放 · ${names.black} vs ${names.red} · 第 ${g.gameNo} 局`;
-  $('rBlackName').innerHTML = `${miniIcon('black')} ${esc(names.black || '黑方')}`;
-  $('rRedName').innerHTML = `${miniIcon('red')} ${esc(names.red || '红方')}`;
+  $('replayTitle').innerHTML = `对局回放 · <span class="t-av">${avatarHtml(avatars.black)}</span>${esc(names.black || '黑方')} vs <span class="t-av">${avatarHtml(avatars.red)}</span>${esc(names.red || '红方')} · 第 ${g.gameNo} 局`;
+  $('rBlackName').innerHTML = `${miniIcon('black')}<span class="r-av">${avatarHtml(avatars.black)}</span>${esc(names.black || '黑方')}`;
+  $('rRedName').innerHTML = `${miniIcon('red')}<span class="r-av">${avatarHtml(avatars.red)}</span>${esc(names.red || '红方')}`;
   rRenderMoveList(); rRenderFrame();
   openModal('replayModal');
 }

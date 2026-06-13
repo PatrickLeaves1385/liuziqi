@@ -224,7 +224,8 @@ const stmtInsertBattle = db.prepare(`
   INSERT INTO battles(battle_url_id,challenger_bot_id,challenged_bot_id,result,ch_rp_delta,cd_rp_delta,played_at)
   VALUES(?,?,?,?,?,?,?)`);
 const stmtListBotBattles = db.prepare(`
-  SELECT bt.*, cb.name AS challenger_name, db2.name AS challenged_name
+  SELECT bt.*, cb.name AS challenger_name, db2.name AS challenged_name,
+    cb.avatar AS challenger_avatar, db2.avatar AS challenged_avatar
   FROM battles bt
   JOIN bots cb ON bt.challenger_bot_id=cb.id
   JOIN bots db2 ON bt.challenged_bot_id=db2.id
