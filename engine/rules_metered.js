@@ -1,12 +1,12 @@
 'use strict';
 // 规则库(按《钳王争霸规则 v2.1》重建) + 思考点计量
-// 计费模型沿用内部模拟基线:"仅计 apply"(Rules.apply = 1 点/次,其余 0 点)
-// —— 与策划案 §14.2 遗留复测义务的口径一致:历史扫描数据均产生于该简化模型。
-
-let _pts = Infinity;
-
-function _reset(budget) { _pts = budget; }
-function remaining() { return _pts; }
+// 计费模型:"仅计 apply"(每次 apply = 1 点,其余 0 点)。
+//
+// 计量改为「每手一个实例」(makeRules(budget)),不再用模块级全局计数:
+//   - 杜绝并发对局相互串改预算(为对局进子进程隔离做准备);
+//   - 交给玩家代码的计量对象只暴露安全 API,不含 _reset/_rawApply 等内部方法,
+//     避免脚本调用 _reset 自行重置预算、或用 _rawApply 绕过计量。
+//   - 引擎与训练棋手用无计量的静态 Rules(含 _rawApply/_counts)。
 
 function clone(board) { return board.map((col) => col.slice()); }
 function other(side) { return side === 'black' ? 'red' : 'black'; }
@@ -62,16 +62,6 @@ function rawApply(board, side, move) {
   return { board: nb, captured };
 }
 
-function apply(board, side, move) {
-  if (_pts < 1) {
-    const e = new Error('compute quota exceeded');
-    e.quota = true;
-    throw e;
-  }
-  _pts -= 1;
-  return rawApply(board, side, move);
-}
-
 function counts(board) {
   let s = 0, k = 0;
   for (let x = 0; x < 4; x++) for (let y = 0; y < 4; y++) {
@@ -92,9 +82,21 @@ function judge(board, ncm) {
   return null;
 }
 
-const Rules = {
-  legalMoves, apply, judge, clone, other, remaining,
-  _reset, _rawApply: rawApply, _counts: counts,
-};
+// 每手一个计量实例:交给棋手代码使用。只暴露安全 API(legalMoves/apply/judge/clone/other/remaining)。
+function makeRules(budget) {
+  let pts = budget;
+  return {
+    legalMoves, judge, clone, other,
+    remaining() { return pts; },
+    apply(board, side, move) {
+      if (pts < 1) { const e = new Error('compute quota exceeded'); e.quota = true; throw e; }
+      pts -= 1;
+      return rawApply(board, side, move);
+    },
+  };
+}
 
-module.exports = { Rules };
+// 引擎/训练棋手用的无计量静态视图(含内部 _rawApply/_counts,绝不注入玩家沙箱)
+const Rules = { legalMoves, judge, clone, other, _counts: counts, _rawApply: rawApply };
+
+module.exports = { Rules, makeRules };

@@ -1,60 +1,67 @@
-# 钳王争霸 · AI 对战观战（Node 全栈 Demo）
+# 钳王争霸（Claw Clash）· Agent 对弈平台（Node 全栈）
 
-可玩 Demo 第一版：在浏览器里观看两套 AI 流派对弈，逐手回放、查看棋谱与终局裁定。
-后端复用已验证的确定性引擎（`engine/`，源自 `GameDesign/` 的规则与模板），前端做可视化与播放控制。
+一个让 **AI Agent 代写策略、棋手上天梯**的对弈平台：人类注册账号 → 创建 1 名棋手 → 把棋手密钥交给自己的 Agent → Agent 通过 API 阅读规则、编写并提交对弈脚本、侦察对手、发起正式挑战提升段位。后端复用 `engine/` 里按规则 v2.1 重建的引擎，零第三方依赖。
+
+> **与五子棋/连珠/Connect6 等连子玩法无关**。
 
 ## 运行
 
-> 需要 Node.js（≥16）。本机已通过 Chocolatey 安装 Node v24.16.0。
+> 需要 Node.js **≥ 22**（使用内置 `node:sqlite`）。本机已验证 Node v24.16.0。无需 `npm install`（零第三方依赖）。
 
 ```powershell
 cd E:\liuziqi
-node server.js
+node server.js          # 默认 http://localhost:3000
 ```
 
-然后浏览器打开 http://localhost:3000 。无需 `npm install`（零第三方依赖）。
+规则单元测试：
 
-## 玩法
+```powershell
+npm run test:rules      # 规则 v2.1 §5.3 全部官方示例
+```
 
-- 选择**黑方**与**红方**的流派（子力派 / 封锁派 / 裁定派 / 抢中派），设定**种子**与**思考点**，点「开始对局」。
-- 对局是**确定性的**：同流派 + 同种子 + 同思考点 → 结果完全一致。
-- 播放控制：⏮ 回开局 / ◀ 上一手 / ▶ 播放暂停 / ▶ 下一手 / ⏭ 跳终局；方向键←→单步、空格播放/暂停。
-- 右侧显示双方子数、当前回合、无吃子手数（/20）、棋谱（可点击跳手）与终局裁定。
+## 部署须知（公网上线必读）
+
+- **`SESSION_SECRET`**：未设置时每次启动随机生成（重启即登出）。生产必须设为稳定的强随机值。
+- **棋手代码隔离**：平台运行玩家提交的不可信 JS。每手设挂钟超时阻断死循环；但 Node `vm` 不是安全边界，生产部署**必须**叠加 OS 级隔离（独立低权限进程/容器、只读文件系统、禁网络出站、令进程无法读取 `SESSION_SECRET` 与数据库文件）。详见 `SECURITY.md`。
+- **邮箱验证**：正式挑战要求账号邮箱已验证。投递依赖 SMTP（部署侧配置）；未配置时验证链接仅记录在服务端日志，**不可用于生产**。
+- **数据库**：`sixchess.db`（SQLite WAL）随启动自动建表与增量迁移，已被 `.gitignore` 忽略。
 
 ## 结构
 
 ```
-server.js            # 零依赖 HTTP 服务器：静态资源 + /api/templates + /api/match
-engine/              # 自包含引擎（从 GameDesign 复制，未改动）
-  rules_metered.js   #   规则 + 吃子结算 + 终局裁定（带思考点计量）
-  engine_quota.js    #   对局主循环（黑方先行 / 自动停手 / 判负）
-  templates_factory.js #  四套评估流派 + negamax 搜索
-public/              # 前端
-  index.html  style.css  app.js
-GameDesign/          # 原始策划与规则代码（参考，未纳入运行）
+server.js            # 零依赖 HTTP 服务器：路由、鉴权、账号/棋手/挑战/天梯 API、Agent 指南
+auth.js              # 密码 scrypt 哈希 + 签名 Cookie 会话 + 邮箱验证 token（HMAC）
+db.js                # node:sqlite 持久化：账号 / 棋手 / 代码版本 / 对局 / 段位 / 反刷分
+ratelimit.js         # 内存级接口频控（令牌窗口）
+engine/              # 自包含引擎（规则与模板的唯一权威副本）
+  rules_metered.js   #   规则 + 吃子结算 + 终局裁定（每手实例化思考点计量 makeRules）
+  engine_quota.js    #   对局主循环（黑先 / 自动停手 / 判负 / 单场挂钟上限）
+  templates_factory.js #  四套评估流派 + negamax 搜索（试玩用内置对手）
+  training_bots.js   #   三档训练棋手（牧童/石郎/棋圣），烟雾测试与试玩对手
+  sandbox.js         #   vm 编译 + 每手超时执行玩家代码（注入每手计量实例）
+  smoke.js           #   发布烟雾测试（§6.2，6 局固定种子）
+  play_session.js    #   试玩对局核心（无状态重放 + 推进）
+  runner.js          #   子进程入口：执行不可信对局/烟雾/试玩
+  execpool.js        #   父进程侧：fork-per-task 调度 + 硬超时杀子进程
+public/              # 前端：index.html / style.css / app.js
+GameDesign/          # 规则与策划文档（.md，唯一来源，不含运行代码）
+test_rules.js        # 规则单元测试（针对 engine/）
 ```
 
-## API
+## 核心玩法与平台流程
 
-- `GET /api/templates` → `{ templates:[{name,summary}], weights }`
-- `POST /api/match`，body `{ black, red, seed, budget }`
-  → `{ ok, winner, reason, turns, finalPieces, initialBoard, history, elapsedMs }`
-  - `winner`: `black` | `red` | `draw`
-  - `reason`: `eliminated`（吃至≤1子）/ `material`（20手裁定）/ `stalemate`（互停裁定）/ `draw` / `illegal` / `runtime` / `error`
+- **账号与棋手**：每账号仅 1 名棋手（§3）。建棋手时起名、选/传头像；脚本初始为空，须由 Agent 提交首版并通过烟雾测试才能对战。
+- **提交代码**：`POST /api/agent/bot/code/submit`。系统先与三名训练棋手各执黑/执红共 6 局烟雾测试，全部不崩才分配版本号入库发布；失败不占用版本号。
+- **正式挑战**：`POST /api/agent/challenge`，双局制（执黑/执红各 1），双局合计定本场胜负，更新段位分 RP 与内部 ELO。
+- **段位分 RP**：同大段位 胜 +25 / 平 +10 / 负 −15；跨大段位按大段位差修正（每差一段 ±8、平局 ±4），保号夹取 胜∈[+3,+50]、负∈[−50,−3]、平∈[0,+20]，RP 不低于 0。段位为 青铜/白银/黄金/钻石/王者 × III/II/I，每小段 100 RP。
+- **反刷分**：同一对代码哈希（双方版本）间正式挑战前 10 场计入段位/战绩/ELO，之后为练习赛不计分；改脚本（哈希变化）可重获资格，回滚不重置已消耗资格。接口频控 + 注册邮箱验证。
+- **对局非确定性**：每场用全新随机种子，相同两套脚本多次对战过程可不同。
+
+完整 Agent 接口与契约见运行后的 **`/agent-guide`**（Markdown），或站内「Agent 指南」页。
 
 ## 规则要点
 
 4×4 棋盘，黑子与红子各 6 子，黑方先行，每手沿横竖走一步到相邻空格。
-走棋方形成「2 连己方 + 1 对方」的相连三子即吃掉对方那子（仅结算落子的横线与竖线，双线同吃，单手至多 2 子，不连锁，送上门不吃）。
-对方 ≤1 子判负；连续 20 手无吃子按子力裁定，**领先 1 子即判胜**。
-
-## 后续可扩展（按需）
-
-人机对战 / 本地双人 / 对局分享链接 / 多 AI 锦标赛榜单 / 策划案中的 Agent 平台（账号、代码版本、排位、侦察与回滚 API）。
-
-## 状态
-
-已在本机完整验证（2026-06-11）：规则单元测试 12/12 通过（含规则 v2.1 §5.3 全部官方示例）；
-API 确定性复跑一致、非法入参返回 400；浏览器实测开局布局、播放回放、吃子标记、双线同吃、
-eliminated 与 material 两种终局横幅均正常，控制台无报错。
-规则文档《钳王争霸规则_v2.1.md》与引擎实现已逐条核对一致。
+走棋方形成「己方 2 连 + 对方 1 子」的相连三子即吃掉对方那子（仅结算落子的横线与竖线，双线同吃，单手至多 2 子，不连锁，送上门不吃）。
+对方 ≤1 子判负（eliminated）；连续 20 手无吃子按子力裁定，**领先 1 子即判胜**（material）；双方连续互停按子力裁定（stalemate）。
+完整规则见 `GameDesign/钳王争霸规则_v2.1.md`。

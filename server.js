@@ -4,24 +4,23 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
-const { playMatch, initBoard } = require('./engine/engine_quota');
-const { Rules } = require('./engine/rules_metered');
-const { makeTemplates } = require('./engine/templates_factory');
-const { makeBot } = require('./engine/sandbox');
-const { TRAINING_BOTS } = require('./engine/training_bots');
-const { runSmokeTests } = require('./engine/smoke');
+const { initBoard } = require('./engine/engine_quota');
+const execpool = require('./engine/execpool'); // 不可信对局/烟雾/试玩 → 隔离子进程执行
 const db = require('./db');
 const auth = require('./auth');
+const rl = require('./ratelimit');
 
 const PORT = process.env.PORT || 3000;
+const IS_PROD = process.env.NODE_ENV === 'production';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const AVATAR_DIR = path.join(PUBLIC_DIR, 'avatars');
 const MAX_AVATAR_BYTES = 100 * 1024; // 100KB
+const MIN_PASSWORD_LEN = 8;
+const MAX_PASSWORD_LEN = 256; // 上限防超长密码拖慢 scrypt
 fs.mkdirSync(AVATAR_DIR, { recursive: true });
 
-// 定稿基线权重（§14.4 sweep 复跑报告）
-const WEIGHTS = { blockMob: 60, rulDef: 8, cenThreat: 15, cenCenter: 50, cenHunt: 4, cenMat: 1000 };
 const TEMPLATE_META = [
   { name: '子力派', summary: '以子力差为主，辅以机动与中心；直接吃子换子。', kind: 'template' },
   { name: '封锁派', summary: '压制对方机动数，把对手逼到无路可走。', kind: 'template' },
@@ -36,18 +35,10 @@ const TRAINING_META = [
 ];
 const OPPONENT_META = [...TEMPLATE_META, ...TRAINING_META];
 const OPPONENT_NAMES = OPPONENT_META.map((t) => t.name);
-function findPlayOpponent(name) {
-  const t = makeTemplates(WEIGHTS).find((b) => b.name === name);
-  if (t) return t;
-  const def = TRAINING_BOTS.find((d) => d.make().name === name);
-  return def ? def.make() : null;
-}
+// 试玩内置对手（流派/训练棋手）的实际构造在 engine/runner.js 子进程内完成。
 
-function piecesOf(board, side) {
-  const p = [];
-  for (let x = 0; x < 4; x++) for (let y = 0; y < 4; y++) if (board[x][y] === side) p.push([x, y]);
-  return p;
-}
+// 反刷分（§8.2.1）：同一对代码哈希（双方版本）之间，前 N 场正式挑战计入段位/战绩/ELO，之后为练习赛不计分。
+const HASH_PAIR_SCORED_LIMIT = 10;
 
 // ---- HTTP 工具 ----
 function sendJson(res, code, obj, extraHeaders) {
@@ -69,10 +60,16 @@ function serveStatic(req, res) {
 }
 function readBody(req) {
   return new Promise((resolve, reject) => {
-    let data = '';
-    req.on('data', (c) => { data += c; if (data.length > 2e6) req.destroy(); });
-    req.on('end', () => resolve(data));
-    req.on('error', reject);
+    let data = '', settled = false;
+    const done = (fn, v) => { if (!settled) { settled = true; fn(v); } };
+    req.on('data', (c) => {
+      if (settled) return;
+      data += c;
+      if (data.length > 2e6) { done(reject, Object.assign(new Error('请求体过大'), { tooLarge: true })); req.destroy(); }
+    });
+    req.on('end', () => done(resolve, data));
+    req.on('error', (e) => done(reject, e));
+    req.on('close', () => done(reject, new Error('连接已关闭'))); // 防客户端中断时 Promise 悬挂
   });
 }
 function parseJson(raw) { try { return JSON.parse(raw || '{}'); } catch { return null; } }
@@ -100,6 +97,28 @@ function requireSession(req) {
 function maskKey(key) {
   if (!key || key.length < 12) return key || '';
   return `${key.slice(0, 8)}••••••${key.slice(-4)}`;
+}
+
+// ---- 频控 / 客户端标识 ----
+function clientIp(req) {
+  return (req.socket && req.socket.remoteAddress) || 'unknown';
+}
+// 命中频控则回 429 并返回 true（调用方应直接 return）
+function rateLimited(res, gate) {
+  if (gate.ok) return false;
+  sendJson(res, 429, { ok: false, error: `请求过于频繁，请 ${gate.retryAfterSec}s 后重试` }, { 'Retry-After': String(gate.retryAfterSec) });
+  return true;
+}
+function originOf(req) { return `http://${req.headers.host || 'localhost:' + PORT}`; }
+
+// 发送邮箱验证链接。生产须接入 SMTP（部署侧）；当前实现仅记录到日志，
+// 非生产环境额外把链接随响应返回，便于演示。返回 { verifyUrl, devExposed }。
+function sendVerificationEmail(req, account) {
+  const token = auth.makeVerifyToken(account.id);
+  const verifyUrl = `${originOf(req)}/api/account/verify?token=${encodeURIComponent(token)}`;
+  // TODO(部署): 接入 SMTP 真正投递到 account.email；勿在生产把链接回传前端。
+  console.log(`[邮箱验证] ${account.email} -> ${verifyUrl}`);
+  return { verifyUrl, devExposed: !IS_PROD };
 }
 
 // ---- 段位分 RP ----
@@ -177,8 +196,14 @@ async function dispatch(req, res) {
       match = req.url.split('?')[0].match(r.pattern);
       if (!match) continue;
     }
-    const body = (req.method === 'POST' || req.method === 'PUT') ? parseJson(await readBody(req)) : {};
-    if (body === null) return sendJson(res, 400, { ok: false, error: 'JSON 解析失败' });
+    let body = {};
+    if (req.method === 'POST' || req.method === 'PUT') {
+      let raw;
+      try { raw = await readBody(req); }
+      catch (e) { return sendJson(res, e && e.tooLarge ? 413 : 400, { ok: false, error: e && e.tooLarge ? '请求体过大' : '读取请求体失败' }); }
+      body = parseJson(raw);
+      if (body === null) return sendJson(res, 400, { ok: false, error: 'JSON 解析失败' });
+    }
     await r.fn(req, res, match, body);
     return;
   }
@@ -204,118 +229,35 @@ route('GET', '/api/templates', (req, res) => {
 //   { history(补全吃子信息), board, counts, legalMoves, toMove, status:{over,winner,reason} }
 // 不入库、不计分。
 // ============================================================
-function mulberry32(a) {
-  return function () {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-route('POST', '/api/play', (req, res, _m, body) => {
+route('POST', '/api/play', async (req, res, _m, body) => {
+  // 试玩无需登录：按 IP 限速，避免匿名刷请求占满隔离子进程池（每场对局都会 fork 子进程）
+  if (rateLimited(res, rl.allow('play:' + clientIp(req), 120, 60 * 1000))) return;
+  // 入参校验 + DB 解析对手 → 余下重放/推进在隔离子进程执行（不信任客户端附带字段）
   const local = body.mode === 'local';
-  let humanSide = null, botSide = null, bot = null, oppName = null;
+  let opponent = null;
   if (!local) {
-    humanSide = body.humanSide;
-    if (humanSide !== 'black' && humanSide !== 'red') return sendJson(res, 400, { ok: false, error: 'humanSide 须为 black/red' });
-    botSide = Rules.other(humanSide);
+    if (body.humanSide !== 'black' && body.humanSide !== 'red')
+      return sendJson(res, 400, { ok: false, error: 'humanSide 须为 black/red' });
     if (body.botId != null) {
       const target = db.getBotById(+body.botId);
       if (!target) return sendJson(res, 404, { ok: false, error: '棋手不存在' });
       const code = db.getLatestPassedVersion(target.id);
       if (!code) return sendJson(res, 422, { ok: false, error: `「${target.name}」尚未发布可用脚本，暂不能对战` });
-      const made = makeBot(code.code, 100);
-      if (!made.bot) return sendJson(res, 500, { ok: false, error: '棋手脚本加载失败' });
-      bot = made.bot; oppName = target.name;
+      opponent = { kind: 'bot', code: code.code, name: target.name };
     } else {
       if (!OPPONENT_NAMES.includes(body.template)) return sendJson(res, 400, { ok: false, error: '对手非法' });
-      bot = findPlayOpponent(body.template); oppName = body.template;
+      opponent = { kind: 'builtin', name: body.template };
     }
   }
-  const rawHistory = Array.isArray(body.history) ? body.history : [];
-  if (rawHistory.length > 2000) return sendJson(res, 400, { ok: false, error: '历史过长' });
-
-  // ---- 重放校验（吃子/pass 由服务端重算，不信任客户端附带字段）----
-  let board = initBoard();
-  let side = 'black', turn = 1, ncm = 0, lastPass = false;
-  const history = [];
-  let status = null; // {winner, reason}
-  const finish = (winner, reason) => { status = { winner, reason }; };
-
-  function applyStep(mv) { // mv: {from,to} 已知合法
-    const r = Rules._rawApply(board, side, mv);
-    board = r.board;
-    ncm = r.captured.length > 0 ? 0 : ncm + 1;
-    history.push({ turn, side, from: mv.from.slice(), to: mv.to.slice(), captured: r.captured, pass: false });
-    lastPass = false; turn++;
-    const v = Rules.judge(board, ncm);
-    if (v) finish(v.winner, v.reason);
-    else side = Rules.other(side);
+  const spec = { mode: body.mode, humanSide: body.humanSide, history: body.history, opponent };
+  let r;
+  try {
+    r = await execpool.runPlay(spec, 'ip:' + clientIp(req));
+  } catch (e) {
+    return sendJson(res, e && e.busy ? 503 : 500, { ok: false, error: e && e.busy ? '试玩执行繁忙，请稍后重试' : '试玩执行失败' });
   }
-  function applyPass() {
-    history.push({ turn, side, from: null, to: null, captured: [], pass: true });
-    ncm++;
-    if (lastPass) { // 连续互停 → 子力裁定
-      const c = Rules._counts(board);
-      finish(c.black === c.red ? 'draw' : (c.black > c.red ? 'black' : 'red'), c.black === c.red ? 'draw' : 'stalemate');
-      return;
-    }
-    lastPass = true; turn++;
-    const v = Rules.judge(board, ncm);
-    if (v) finish(v.winner, v.reason);
-    else side = Rules.other(side);
-  }
-
-  for (const h of rawHistory) {
-    if (status) return sendJson(res, 400, { ok: false, error: '历史在终局后仍有着法' });
-    if (!h || h.side !== side) return sendJson(res, 400, { ok: false, error: `第 ${turn} 手行棋方不符` });
-    const moves = Rules.legalMoves(board, side);
-    if (h.pass) {
-      if (moves.length > 0) return sendJson(res, 400, { ok: false, error: `第 ${turn} 手有合法走法，不能停一手` });
-      applyPass();
-    } else {
-      const ok = h.from && h.to && moves.some((m) => m.from[0] === h.from[0] && m.from[1] === h.from[1] && m.to[0] === h.to[0] && m.to[1] === h.to[1]);
-      if (!ok) return sendJson(res, 400, { ok: false, error: `第 ${turn} 手走法非法` });
-      applyStep({ from: h.from, to: h.to });
-    }
-  }
-
-  // ---- 推进到人类可走为止：机器人应手 / 双方无子可动自动 pass ----
-  // local 模式无机器人：仅自动 pass，轮到任一方有棋可走即停
-  while (!status) {
-    const moves = Rules.legalMoves(board, side);
-    if (moves.length === 0) { applyPass(); continue; }
-    if (local || side === humanSide) break; // 轮到人类且有棋可走
-    // 机器人走子（预算 100 思考点，与正式对局一致）
-    Rules._reset(100);
-    const oppSide = Rules.other(side);
-    const myPieces = piecesOf(board, side), opPieces = piecesOf(board, oppSide);
-    const game = {
-      board: Rules.clone(board), turnNumber: turn, noCaptureMoves: ncm,
-      legalMoves: moves.map((m) => ({ from: m.from.slice(), to: m.to.slice() })),
-      history, random: mulberry32((0x5EED ^ (turn * 2654435761)) >>> 0),
-    };
-    let mv;
-    try {
-      mv = bot.onTurn(
-        { side, pieces: myPieces, capturedCount: 6 - myPieces.length },
-        { side: oppSide, pieces: opPieces, capturedCount: 6 - opPieces.length },
-        game,
-      );
-    } catch { finish(humanSide, 'error'); break; }
-    const ok = mv && mv.from && mv.to && moves.some((m) => m.from[0] === mv.from[0] && m.from[1] === mv.from[1] && m.to[0] === mv.to[0] && m.to[1] === mv.to[1]);
-    if (!ok) { finish(humanSide, 'illegal'); break; }
-    applyStep(mv);
-  }
-
-  const toMove = status ? null : (local ? side : humanSide);
-  const legal = status ? [] : Rules.legalMoves(board, toMove);
-  sendJson(res, 200, {
-    ok: true, mode: local ? 'local' : 'vs', opponent: oppName, humanSide, botSide, toMove,
-    initialBoard: initBoard(), history, board, counts: Rules._counts(board),
-    legalMoves: legal,
-    status: status ? { over: true, winner: status.winner, reason: status.reason, turns: history.length } : { over: false, turns: history.length },
-  });
+  if (!r.ok) return sendJson(res, r.status || 400, { ok: false, error: r.error });
+  sendJson(res, 200, r.payload);
 });
 
 // ============================================================
@@ -324,6 +266,7 @@ route('POST', '/api/play', (req, res, _m, body) => {
 // 昵称/邮箱冲突分别返回 409 { field }
 // ============================================================
 route('POST', '/api/account/register', (req, res, _m, body) => {
+  if (rateLimited(res, rl.allow('reg:' + clientIp(req), 5, 10 * 60 * 1000))) return;
   const nickname = (body.nickname || '').trim();
   const email = (body.email || '').trim().toLowerCase();
   const password = body.password || '';
@@ -331,30 +274,63 @@ route('POST', '/api/account/register', (req, res, _m, body) => {
     return sendJson(res, 400, { ok: false, error: '昵称、邮箱、密码均为必填' });
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))
     return sendJson(res, 400, { ok: false, error: '邮箱格式不正确' });
-  if (password.length < 8)
-    return sendJson(res, 400, { ok: false, error: '密码至少 8 位' });
+  if (password.length < MIN_PASSWORD_LEN || password.length > MAX_PASSWORD_LEN)
+    return sendJson(res, 400, { ok: false, error: `密码需 ${MIN_PASSWORD_LEN}–${MAX_PASSWORD_LEN} 位` });
   if (db.getAccountByNickname(nickname))
     return sendJson(res, 409, { ok: false, field: 'nickname', error: '昵称已被占用' });
   if (db.getAccountByEmail(email))
     return sendJson(res, 409, { ok: false, field: 'email', error: '该邮箱已注册' });
   const account = db.createAccount(nickname, email, auth.hashPassword(password));
-  sendJson(res, 201, { ok: true, accountId: account.id, nickname: account.nickname }, { 'Set-Cookie': auth.sessionCookie(account.id) });
+  const mail = sendVerificationEmail(req, account);
+  sendJson(res, 201, {
+    ok: true, accountId: account.id, nickname: account.nickname,
+    emailVerified: false,
+    // 仅非生产环境回传验证链接，便于演示（生产由邮件投递）
+    verifyUrl: mail.devExposed ? mail.verifyUrl : undefined,
+  }, { 'Set-Cookie': auth.sessionCookie(account.id) });
 });
 
 // ============================================================
 // § 登录 / 登出
 // ============================================================
 route('POST', '/api/auth/login', (req, res, _m, body) => {
+  if (rateLimited(res, rl.allow('login:' + clientIp(req), 10, 5 * 60 * 1000))) return;
   const email = (body.email || '').trim().toLowerCase();
   const password = body.password || '';
   const account = db.getAccountByEmail(email);
-  if (!account || !auth.verifyPassword(password, account.password_hash))
+  // password.length 短路在 verifyPassword 之前：超长密码不可能匹配（注册已限长），直接挡掉 scrypt 开销
+  if (!account || password.length > MAX_PASSWORD_LEN || !auth.verifyPassword(password, account.password_hash))
     return sendJson(res, 401, { ok: false, error: '邮箱或密码错误' });
   sendJson(res, 200, { ok: true, accountId: account.id, nickname: account.nickname }, { 'Set-Cookie': auth.sessionCookie(account.id) });
 });
 
 route('POST', '/api/auth/logout', (req, res) => {
   sendJson(res, 200, { ok: true }, { 'Set-Cookie': auth.clearCookie() });
+});
+
+// ============================================================
+// § 邮箱验证：点击邮件链接 / 站内重新发送
+// ============================================================
+route('GET', '/api/account/verify', (req, res) => {
+  const url = new URL(req.url, 'http://x');
+  const accountId = auth.verifyVerifyToken(url.searchParams.get('token') || '');
+  const page = (title, msg) => {
+    res.writeHead(accountId ? 200 : 400, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(`<!doctype html><meta charset="utf-8"><title>${title}</title><body style="font-family:system-ui;max-width:520px;margin:80px auto;text-align:center;color:#274"><h2>${title}</h2><p>${msg}</p><p><a href="/">返回钳王争霸</a></p></body>`);
+  };
+  if (!accountId) return page('验证链接无效或已过期', '请重新登录后在「我的棋手」里重新发送验证邮件。');
+  if (!db.getAccountById(accountId)) return page('账号不存在', '该账号可能已被删除。');
+  db.setEmailVerified(accountId);
+  page('邮箱验证成功 ✓', '现在可以发起正式挑战、参与天梯排位了。');
+});
+
+route('POST', '/api/account/resend-verification', (req, res) => {
+  const { account, error } = requireSession(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  if (rateLimited(res, rl.allow('verify:' + account.id, 3, 10 * 60 * 1000))) return;
+  if (account.email_verified) return sendJson(res, 200, { ok: true, emailVerified: true, message: '邮箱已验证' });
+  const mail = sendVerificationEmail(req, account);
+  sendJson(res, 200, { ok: true, emailVerified: false, verifyUrl: mail.devExposed ? mail.verifyUrl : undefined });
 });
 
 // ============================================================
@@ -368,6 +344,7 @@ route('GET', '/api/me', (req, res) => {
   sendJson(res, 200, {
     ok: true,
     account: { id: account.id, nickname: account.nickname, email: account.email },
+    emailVerified: !!account.email_verified,
     hasBot: !!bot,
     bot: bot ? { id: bot.id, name: bot.name, avatar: bot.avatar, rp: bot.rp, rankPosition: db.getBotRankPosition(bot.id), currentVersion: bot.current_version } : null,
   });
@@ -560,6 +537,7 @@ function battleView(b, botId) {
     opponentAvatar: isCh ? b.challenged_avatar : b.challenger_avatar,
     result: persp(b.result),
     rpDelta: isCh ? b.ch_rp_delta : b.cd_rp_delta,
+    scored: b.scored == null ? 1 : b.scored,
     games: b.games.map((g) => ({
       gameNo: g.game_no, matchUrlId: g.match_url_id,
       result: persp(g.winner),
@@ -587,7 +565,20 @@ route('GET', '/api/bot/me/matches', (req, res) => {
 route('GET', '/api/agent/bot/info', (req, res) => {
   const { bot, error } = requireAuth(req);
   if (error) return sendJson(res, 401, { ok: false, error });
-  sendJson(res, 200, { ok: true, bot });
+  // 白名单字段：不外泄内部 ELO（rating，§6 仅作匹配用）与 account_id
+  const total = bot.wins + bot.losses + bot.draws;
+  sendJson(res, 200, {
+    ok: true,
+    bot: {
+      id: bot.id, name: bot.name, avatar: bot.avatar,
+      rp: bot.rp, rank: rankLabel(bot.rp), rankPosition: db.getBotRankPosition(bot.id),
+      wins: bot.wins, losses: bot.losses, draws: bot.draws,
+      winRate: total ? Math.round((bot.wins / total) * 100) : null,
+      currentVersion: bot.current_version,
+      status: bot.current_version === 0 ? 'empty' : 'active',
+      createdAt: bot.created_at,
+    },
+  });
 });
 
 // ============================================================
@@ -595,15 +586,18 @@ route('GET', '/api/agent/bot/info', (req, res) => {
 // POST /api/agent/bot/code/submit  (需 Auth)
 // body: { code, notes, submittedBy }
 // ============================================================
-route('POST', '/api/agent/bot/code/submit', (req, res, _m, body) => {
+route('POST', '/api/agent/bot/code/submit', async (req, res, _m, body) => {
   const { bot, error } = requireAuth(req);
   if (error) return sendJson(res, 401, { ok: false, error });
+  if (rateLimited(res, rl.allow('publish:' + bot.id, 6, 60 * 1000))) return; // §6.2 发布频控
   const { code, notes, submittedBy } = body;
   if (!code || typeof code !== 'string') return sendJson(res, 400, { ok: false, error: '缺少 code 字段' });
   if (!submittedBy) return sendJson(res, 400, { ok: false, error: '缺少 submittedBy 字段（§6.2）' });
 
-  // 先测后存（§6.2）：烟雾测试通过才分配版本号入库，失败不占用版本号
-  const { passed, failures } = runSmokeTests(code);
+  // 先测后存（§6.2）：烟雾测试在隔离子进程跑，通过才分配版本号入库，失败不占用版本号
+  let passed, failures;
+  try { ({ passed, failures } = await execpool.runSmoke(code, 'bot:' + bot.id)); }
+  catch (e) { return sendJson(res, e && e.busy ? 503 : 500, { ok: false, error: e && e.busy ? '发布执行繁忙，请稍后重试' : '烟雾测试执行失败，请重试' }); }
   if (!passed) {
     return sendJson(res, 422, {
       ok: false, smokeStatus: 'failed',
@@ -622,9 +616,10 @@ route('POST', '/api/agent/bot/code/submit', (req, res, _m, body) => {
 // POST /api/agent/bot/code/revert
 // body: { toVersion, notes, submittedBy }
 // ============================================================
-route('POST', '/api/agent/bot/code/revert', (req, res, _m, body) => {
+route('POST', '/api/agent/bot/code/revert', async (req, res, _m, body) => {
   const { bot, error } = requireAuth(req);
   if (error) return sendJson(res, 401, { ok: false, error });
+  if (rateLimited(res, rl.allow('publish:' + bot.id, 6, 60 * 1000))) return; // 与发布共享频控
   const { toVersion, submittedBy } = body;
   if (!submittedBy) return sendJson(res, 400, { ok: false, error: '缺少 submittedBy' });
   const target = db.getVersion(bot.id, +toVersion);
@@ -635,7 +630,9 @@ route('POST', '/api/agent/bot/code/revert', (req, res, _m, body) => {
     return sendJson(res, 400, { ok: false, error: '目标版本代码与当前版本一致，无需回滚（§6.2a）' });
 
   // 回滚同样先测后存（§6.2a：计费费率可能已变更，旧代码不保证合规）；失败不占用版本号
-  const { passed, failures } = runSmokeTests(target.code);
+  let passed, failures;
+  try { ({ passed, failures } = await execpool.runSmoke(target.code, 'bot:' + bot.id)); }
+  catch (e) { return sendJson(res, e && e.busy ? 503 : 500, { ok: false, error: e && e.busy ? '执行繁忙，请稍后重试' : '烟雾测试执行失败，请重试' }); }
   if (!passed) {
     return sendJson(res, 422, {
       ok: false, smokeStatus: 'failed',
@@ -672,9 +669,15 @@ route('GET', '/api/agent/bot/code/versions', (req, res) => {
 // body: { challengedBotId }  (需 Auth，以 challenger 身份)
 // 规则：双局制（执黑/执红各 1）；双局合计分 → ELO 更新；哈希对计分资格记录
 // ============================================================
-route('POST', '/api/agent/challenge', (req, res, _m, body) => {
+route('POST', '/api/agent/challenge', async (req, res, _m, body) => {
   const { bot: challenger, error } = requireAuth(req);
   if (error) return sendJson(res, 401, { ok: false, error });
+  if (rateLimited(res, rl.allow('challenge:' + challenger.id, 30, 60 * 1000))) return;
+
+  // 邮箱验证门槛（§1 防多账号刷分）：未验证账号不能发起正式挑战
+  const chAccount = db.getAccountById(challenger.account_id);
+  if (!chAccount || !chAccount.email_verified)
+    return sendJson(res, 403, { ok: false, error: '请先验证账号邮箱后再发起正式挑战（站内「我的棋手」可重新发送验证邮件）' });
 
   const challengedId = +body.challengedBotId;
   if (!challengedId || challengedId === challenger.id)
@@ -687,17 +690,20 @@ route('POST', '/api/agent/challenge', (req, res, _m, body) => {
   if (!chCode) return sendJson(res, 422, { ok: false, error: '你尚未发布可用代码（需先通过烟雾测试）' });
   if (!cdCode) return sendJson(res, 422, { ok: false, error: '对手尚未发布可用代码' });
 
-  const { bot: chBot } = makeBot(chCode.code, 100);
-  const { bot: cdBot } = makeBot(cdCode.code, 100);
-  if (!chBot || !cdBot) return sendJson(res, 500, { ok: false, error: '棋手代码加载失败' });
-
   const BUDGET = 100;
   const baseUrlId = db.urlId();
-  const baseSeed = Date.now() % 1000000;
+  // 每场用全新随机种子：对局非确定性，相同两套脚本多次对战过程可不同（防"可复现刷分"，也更具观赏性）。
+  const baseSeed = crypto.randomInt(0, 1 << 30);
 
-  // 双局：第 1 局 challenger=black，第 2 局 challenger=red
-  const game1 = playMatch({ black: chBot, red: cdBot }, baseSeed, BUDGET);
-  const game2 = playMatch({ black: cdBot, red: chBot }, baseSeed + 1, BUDGET);
+  // 双局（执黑/执红各 1）在隔离子进程执行：第 1 局 challenger=black，第 2 局 challenger=red
+  let game1, game2;
+  try {
+    const out = await execpool.runChallenge(chCode.code, cdCode.code, baseSeed, BUDGET, 'bot:' + challenger.id);
+    if (out && out.loadFailed) return sendJson(res, 500, { ok: false, error: '棋手代码加载失败' });
+    ({ game1, game2 } = out);
+  } catch (e) {
+    return sendJson(res, e && e.busy ? 503 : 500, { ok: false, error: e && e.busy ? '对战执行繁忙，请稍后重试' : '对战执行失败，请重试' });
+  }
 
   // 从引擎视角换算为挑战者视角的胜负
   function challengerWinner(result, challengerSide) {
@@ -715,30 +721,40 @@ route('POST', '/api/agent/challenge', (req, res, _m, body) => {
     else { chScore += 1; cdScore += 1; }
   }
 
-  // ELO 更新（内部实力分）
-  const chFrac = chScore / 4; // 挑战者在 4 分满分中的占比
-  const newChRating = db.eloUpdate(challenger.rating, challenged.rating, chFrac);
-  const newCdRating = db.eloUpdate(challenged.rating, challenger.rating, 1 - chFrac);
-
-  // 段位分 RP 更新（双局合计定本场胜负；修正按赛前大段位差）
+  // 本场结果（双局合计定胜负，无论是否计分都据此展示/回放）
   const chResult = chScore > cdScore ? 'win' : chScore < cdScore ? 'loss' : 'draw';
   const cdResult = chResult === 'win' ? 'loss' : chResult === 'loss' ? 'win' : 'draw';
-  const newChRp = Math.max(0, challenger.rp + rpDelta(chResult, challenger.rp, challenged.rp));
-  const newCdRp = Math.max(0, challenged.rp + rpDelta(cdResult, challenged.rp, challenger.rp));
-  // 战绩按场计：本场胜/负/平各 +1
-  const inc = (r) => [r === 'win' ? 1 : 0, r === 'loss' ? 1 : 0, r === 'draw' ? 1 : 0];
-  db.updateRating(challenger.id, newChRating, newChRp, ...inc(chResult));
-  db.updateRating(challenged.id, newCdRating, newCdRp, ...inc(cdResult));
+  const battleResult = chResult === 'win' ? 'challenger' : chResult === 'loss' ? 'challenged' : 'draw';
 
-  // 哈希对计分资格（§8.2.1）
+  // 反刷分（§8.2.1）：同一对代码哈希（双方版本）之间，前 HASH_PAIR_SCORED_LIMIT 场计入段位/战绩/ELO；
+  // 之后为练习赛不计分。回滚因哈希不变 → 不重置已消耗资格。改进脚本（哈希变化）可重获资格。
+  const prior = db.getHashPair(challenger.id, chCode.code_hash, cdCode.code_hash);
+  const priorCount = prior ? prior.used_count : 0;
+  const scored = priorCount < HASH_PAIR_SCORED_LIMIT;
+
+  let newChRp = challenger.rp, newCdRp = challenged.rp;
+  if (scored) {
+    // ELO 更新（内部实力分）
+    const chFrac = chScore / 4; // 挑战者在 4 分满分中的占比
+    const newChRating = db.eloUpdate(challenger.rating, challenged.rating, chFrac);
+    const newCdRating = db.eloUpdate(challenged.rating, challenger.rating, 1 - chFrac);
+    // 段位分 RP（修正按赛前大段位差）
+    newChRp = Math.max(0, challenger.rp + rpDelta(chResult, challenger.rp, challenged.rp));
+    newCdRp = Math.max(0, challenged.rp + rpDelta(cdResult, challenged.rp, challenger.rp));
+    // 战绩按场计：本场胜/负/平各 +1
+    const inc = (r) => [r === 'win' ? 1 : 0, r === 'loss' ? 1 : 0, r === 'draw' ? 1 : 0];
+    db.updateRating(challenger.id, newChRating, newChRp, ...inc(chResult));
+    db.updateRating(challenged.id, newCdRating, newCdRp, ...inc(cdResult));
+  }
+  // 记录哈希对（用于资格判定；回滚不重置）
   db.recordHashPair(challenger.id, chCode.code_hash, cdCode.code_hash);
   db.recordHashPair(challenged.id, cdCode.code_hash, chCode.code_hash);
 
-  // 存储本场（双局合计结果 + RP 增减）与两局对局
-  const battleResult = chResult === 'win' ? 'challenger' : chResult === 'loss' ? 'challenged' : 'draw';
+  // 存储本场（双局合计结果 + RP 增减 + 是否计分）与两局对局
   const battleId = db.createBattle({
     urlId: baseUrlId, challengerBotId: challenger.id, challengedBotId: challenged.id,
     result: battleResult, chRpDelta: newChRp - challenger.rp, cdRpDelta: newCdRp - challenged.rp,
+    scored: scored ? 1 : 0,
   });
   const matchUrlId1 = baseUrlId + 'a';
   const matchUrlId2 = baseUrlId + 'b';
@@ -753,11 +769,14 @@ route('POST', '/api/agent/challenge', (req, res, _m, body) => {
       { matchUrlId: matchUrlId1, challengerSide: 'black', winner: w1, reason: game1.reason, turns: game1.turns },
       { matchUrlId: matchUrlId2, challengerSide: 'red', winner: w2, reason: game2.reason, turns: game2.turns },
     ],
+    scored,
     rpChange: {
       challenger: { from: challenger.rp, to: newChRp, rank: rankLabel(newChRp) },
       challenged: { from: challenged.rp, to: newCdRp, rank: rankLabel(newCdRp) },
     },
-    hashPairNote: '哈希对计分资格已记录；回滚不重置已消耗资格（§6.2a）',
+    scoringNote: scored
+      ? `本场计入段位/战绩/ELO。该哈希对（双方当前版本）还可计分 ${Math.max(0, HASH_PAIR_SCORED_LIMIT - (priorCount + 1))} 场（共 ${HASH_PAIR_SCORED_LIMIT} 场），之后为练习赛不计分（回滚不重置，§6.2a）；改进脚本（哈希变化）可重获资格。`
+      : `本场为练习赛不计分：该哈希对（双方当前版本）已用满 ${HASH_PAIR_SCORED_LIMIT} 场计分资格。改进并发布新版本（哈希变化）即可重新计分。`,
   });
 });
 
@@ -908,7 +927,8 @@ const AGENT_GUIDE_MD = `# 钳王争霸 Agent 指南
       return game.legalMoves[0]; // 返回 { from:[x,y], to:[x,y] }
     };
 
-- **每手算力上限 = 100 思考点，这是计算量限制、不是时间限制**：平台不限制挂钟时间（不存在「每手 100ms 超时判负」之类规则），只限制 Rules.apply 的调用次数——每手开始重置为 100 点，每调用一次 Rules.apply 扣 1 点。如此计量是为保证对局**完全确定性**：胜负与机器快慢无关、可复现、可被侦察复盘。
+- **每手算力上限 = 100 思考点**：每调用一次 Rules.apply 扣 1 点，每手开始重置为 100 点；点数保证胜负只取决于棋力、与机器快慢无关。此外平台对每手设有挂钟超时（数秒级），用于阻断死循环/超长耗时——超时当回合判 runtime 负，请勿编写无界循环。
+- **对局不是确定性的**：每场正式挑战使用全新随机种子，相同的两套脚本多次对战，过程与结果都可能不同；请勿假设「同脚本 + 同对手 → 同一盘棋」。
 - 点数耗尽后再调用 Rules.apply 会抛异常，当回合判 runtime 负。建议在搜索/推演循环里用 Rules.remaining() 自查余量、留好余地。
 - 计点的只有 apply（推演一步落子及吃子结果）；legalMoves / judge / clone / other / remaining 等其余调用不计点。
 - 可用 Rules API：legalMoves(board, side)、apply(board, side, move)、judge(board, ncm)、clone(board)、other(side)、remaining()。
@@ -937,12 +957,13 @@ const AGENT_GUIDE_MD = `# 钳王争霸 Agent 指南
 - 双局制（执黑、执红各 1），双局合计定本场胜负。
 - 段位分 RP：同大段位 胜 +25 / 平 +10 / 负 −15；跨大段位按段位差 d（对手大段 − 本方大段，每差一段 ±8、平局 ±4）修正——战胜强者多得、输给强者少扣、战胜弱者少得、输给弱者多扣。保号夹取：胜 ∈ [+3,+50]、负 ∈ [−50,−3]、平 ∈ [0,+20]，RP 不低于 0。
 - 段位：青铜/白银/黄金/钻石/王者 五大段 × III/II/I 三小段，每小段 100 RP（青铜III 从 0 起）。
-- 哈希对计分资格按代码哈希判定：同一对代码哈希的重复挑战收益受限；回滚不重置已消耗资格。
+- **反刷分（按哈希对计分）**：同一对代码哈希（双方当前版本）之间，正式挑战**前 ${HASH_PAIR_SCORED_LIMIT} 场**计入段位/战绩/ELO，之后为练习赛不计分（响应 \`scored:false\`）。改进并发布新版本（哈希变化）即可重获 ${HASH_PAIR_SCORED_LIMIT} 场计分资格；回滚因哈希不变不重置已消耗资格。
+- **门槛与频控**：发起正式挑战要求账号**邮箱已验证**；挑战/发布/登录/注册等接口有频控，超限返回 429（含 Retry-After）。
 
 ## 良好 Agent 行为
 
 - 发布后若真实对局出现 runtime/error 回归，先 revert 止血，再离线修复，不要带病迭代。
-- 对局是确定性的；挑战前用侦察接口读对手近期棋路并针对性备战是受鼓励的合法 meta。
+- 挑战前用侦察接口读对手近期棋路、了解其大致风格并针对性备战，是受鼓励的合法 meta。注意对局非确定性（每场随机种子），侦察只能把握风格倾向，无法精确预测具体某盘。
 - 发布新版本（代码哈希变化）天然就是防侦察手段。
 - 推荐循环：读榜 → 侦察候选对手 → 离线改进脚本 → 提交过烟雾 → 挑战 → 复盘。
 `;

@@ -3,7 +3,7 @@
 // - 黑方先行;每手前重置走棋方思考点为 budget
 // - 无合法走法由引擎自动 pass(计入 noCaptureMoves),连续互停 → stalemate 按子力裁定
 // - illegal / error / runtime(超点)立即判负
-const { Rules } = require('./rules_metered');
+const { Rules, makeRules } = require('./rules_metered');
 
 function mulberry32(a) {
   return function () {
@@ -28,17 +28,21 @@ function piecesOf(board, side) {
 }
 
 // bots = { black: bot, red: bot }
-function playMatch(bots, seed, budget) {
+// maxMatchMs：单场挂钟上限（安全阀，防"每手不超时但整体长拖"的慢速消耗）。
+// 超时则中止，由"该走方"判 runtime 负——正常对局远达不到此值。
+function playMatch(bots, seed, budget, maxMatchMs = 10000) {
   const rnd = mulberry32(seed);
   let board = initBoard();
   let side = 'black', turn = 1, ncm = 0, lastPass = false;
   const history = [];
+  const deadline = Date.now() + maxMatchMs;
 
   const fin = (winner, reason) => ({
     winner, reason, history, turns: history.length, finalPieces: Rules._counts(board),
   });
 
   while (true) {
+    if (Date.now() > deadline) return fin(Rules.other(side), 'runtime'); // 单场超时：该走方判负
     const moves = Rules.legalMoves(board, side);
 
     if (moves.length === 0) { // 停一手:引擎自动 pass,不调用 onTurn
@@ -57,7 +61,6 @@ function playMatch(bots, seed, budget) {
     }
 
     lastPass = false;
-    Rules._reset(budget); // 每手重置思考点
     const oppSide = Rules.other(side);
     const myPieces = piecesOf(board, side), opPieces = piecesOf(board, oppSide);
     const me = { side, pieces: myPieces, capturedCount: 6 - myPieces.length };
@@ -69,6 +72,7 @@ function playMatch(bots, seed, budget) {
       legalMoves: moves.map((m) => ({ from: m.from.slice(), to: m.to.slice() })),
       history,
       random: rnd,
+      rules: makeRules(budget), // 本手计量实例(交给棋手)
     };
 
     let mv;
@@ -94,4 +98,4 @@ function playMatch(bots, seed, budget) {
   }
 }
 
-module.exports = { playMatch, initBoard };
+module.exports = { playMatch, initBoard, mulberry32, piecesOf };

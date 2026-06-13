@@ -4,3 +4,6 @@ node_modules/
 sixchess.db
 sixchess.db-shm
 sixchess.db-wal
+
+# 运行时上传的棋手头像（启动时自动重建目录）
+public/avatars/

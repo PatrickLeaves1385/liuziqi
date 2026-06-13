@@ -204,6 +204,7 @@ select:focus,input:focus,textarea:focus { outline:none; border-color:var(--mint)
 .rp-delta { font-size:12px; font-weight:700; margin-left:8px; color:var(--muted); }
 .rp-delta.up { color:var(--ok); }
 .rp-delta.down { color:var(--warn); }
+.rp-delta.practice { color:var(--muted); font-weight:600; }
 
 /* ---- 头像选择器 ---- */
 .avatar-picker { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin:8px 0; }

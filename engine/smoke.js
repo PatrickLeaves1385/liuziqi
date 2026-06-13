@@ -22,7 +22,7 @@ const FAIL_REASONS = new Set(['illegal', 'runtime', 'error']);
 // 运行烟雾测试，返回 { passed, failures }
 // failures: 数组，每条 { opponent, side, seed, reason, turn, detail }
 function runSmokeTests(code) {
-  const { bot: userBot, error: compileError } = makeBot(code, BUDGET);
+  const { bot: userBot, error: compileError } = makeBot(code);
   if (compileError) {
     return {
       passed: false,

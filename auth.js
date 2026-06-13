@@ -50,6 +50,30 @@ function verifyToken(token) {
   return Number.isInteger(accountId) ? accountId : null;
 }
 
+// ---- 邮箱验证 token（与会话同密钥签名，但带 purpose 前缀，二者不可互换）----
+const VERIFY_TTL_MS = 24 * 60 * 60 * 1000; // 24 小时
+function makeVerifyToken(accountId) {
+  const exp = Date.now() + VERIFY_TTL_MS;
+  const payload = `verify:${accountId}|${exp}`;
+  return `${b64url(payload)}.${sign(payload)}`;
+}
+// 验签并取 accountId；失败返回 null
+function verifyVerifyToken(token) {
+  if (!token || !token.includes('.')) return null;
+  const [body, mac] = token.split('.');
+  let payload;
+  try { payload = Buffer.from(body, 'base64url').toString('utf8'); } catch { return null; }
+  const a = Buffer.from(mac);
+  const b = Buffer.from(sign(payload));
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  if (!payload.startsWith('verify:')) return null;
+  const [idStr, expStr] = payload.slice('verify:'.length).split('|');
+  const exp = +expStr;
+  if (!exp || Date.now() > exp) return null;
+  const accountId = +idStr;
+  return Number.isInteger(accountId) ? accountId : null;
+}
+
 // ---- Cookie 解析 / 下发 ----
 function parseCookies(req) {
   const header = req.headers['cookie'] || '';
@@ -79,5 +103,6 @@ function sessionAccountId(req) {
 module.exports = {
   COOKIE_NAME,
   hashPassword, verifyPassword,
+  makeVerifyToken, verifyVerifyToken,
   parseCookies, sessionCookie, clearCookie, sessionAccountId,
 };

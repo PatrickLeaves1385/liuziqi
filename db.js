@@ -10,11 +10,12 @@ PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS accounts (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  nickname      TEXT    UNIQUE NOT NULL,
-  email         TEXT    UNIQUE NOT NULL,
-  password_hash TEXT    NOT NULL,
-  created_at    INTEGER NOT NULL
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  nickname       TEXT    UNIQUE NOT NULL,
+  email          TEXT    UNIQUE NOT NULL,
+  password_hash  TEXT    NOT NULL,
+  email_verified INTEGER NOT NULL DEFAULT 0,  -- 正式挑战要求已验证
+  created_at     INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS bots (
@@ -22,14 +23,12 @@ CREATE TABLE IF NOT EXISTS bots (
   account_id           INTEGER UNIQUE NOT NULL,
   name                 TEXT    NOT NULL,
   avatar               TEXT    NOT NULL DEFAULT 'preset:1',  -- 'preset:1..6' 或 'upload:<botId>'
-  template_name        TEXT,                                 -- 可空：建棋手不再选流派
   current_version      INTEGER NOT NULL DEFAULT 0,
   rating               INTEGER NOT NULL DEFAULT 1200,        -- ELO 内部实力分（不对外展示）
   rp                   INTEGER NOT NULL DEFAULT 0,           -- 段位分（对外展示，决定段位）
   wins INTEGER NOT NULL DEFAULT 0,
   losses INTEGER NOT NULL DEFAULT 0,
   draws INTEGER NOT NULL DEFAULT 0,
-  delete_cooldown_until INTEGER,
   created_at           INTEGER NOT NULL,
   FOREIGN KEY (account_id) REFERENCES accounts(id)
 );
@@ -67,6 +66,7 @@ CREATE TABLE IF NOT EXISTS battles (
   result            TEXT    NOT NULL,   -- 'challenger' | 'challenged' | 'draw'（双局合计的本场结果）
   ch_rp_delta       INTEGER,            -- 本场挑战者 RP 增减（历史回填数据为 NULL）
   cd_rp_delta       INTEGER,
+  scored            INTEGER NOT NULL DEFAULT 1,  -- 0=练习赛（哈希对资格已用尽，不计段位/战绩）
   played_at         INTEGER NOT NULL,
   FOREIGN KEY (challenger_bot_id) REFERENCES bots(id),
   FOREIGN KEY (challenged_bot_id) REFERENCES bots(id)
@@ -117,14 +117,25 @@ if (!matchCols.includes('battle_id')) db.exec('ALTER TABLE matches ADD COLUMN ba
 if (!matchCols.includes('game_no')) db.exec('ALTER TABLE matches ADD COLUMN game_no INTEGER');
 db.exec('CREATE INDEX IF NOT EXISTS idx_matches_battle ON matches(battle_id)');
 
+// ---- 增量迁移：accounts.email_verified（既有账号早于本功能，回填为已验证免打扰）----
+const acctCols = db.prepare('PRAGMA table_info(accounts)').all().map((c) => c.name);
+if (!acctCols.includes('email_verified')) {
+  db.exec('ALTER TABLE accounts ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0');
+  db.exec('UPDATE accounts SET email_verified=1');
+}
+// ---- 增量迁移：battles.scored（反刷分：哈希对前若干场计分，之后练习赛不计分）----
+const battleCols = db.prepare('PRAGMA table_info(battles)').all().map((c) => c.name);
+if (!battleCols.includes('scored')) db.exec('ALTER TABLE battles ADD COLUMN scored INTEGER NOT NULL DEFAULT 1');
+
 // 战绩口径为「场」：从 battles 全量重算各棋手 W/L/D（幂等）
+// 仅统计计分场（scored=1），与增量战绩口径一致——练习赛不计入战绩。
 function recomputeBotStats() {
   const calc = db.prepare(`
     SELECT
       SUM(CASE WHEN (challenger_bot_id=? AND result='challenger') OR (challenged_bot_id=? AND result='challenged') THEN 1 ELSE 0 END) AS w,
       SUM(CASE WHEN (challenger_bot_id=? AND result='challenged') OR (challenged_bot_id=? AND result='challenger') THEN 1 ELSE 0 END) AS l,
       SUM(CASE WHEN result='draw' THEN 1 ELSE 0 END) AS d
-    FROM battles WHERE challenger_bot_id=? OR challenged_bot_id=?`);
+    FROM battles WHERE (challenger_bot_id=? OR challenged_bot_id=?) AND scored=1`);
   const setStats = db.prepare('UPDATE bots SET wins=?,losses=?,draws=? WHERE id=?');
   for (const b of db.prepare('SELECT id FROM bots').all()) {
     const r = calc.get(b.id, b.id, b.id, b.id, b.id, b.id);
@@ -178,6 +189,7 @@ const stmtInsertAccount = db.prepare('INSERT INTO accounts(nickname,email,passwo
 const stmtGetAccountByEmail = db.prepare('SELECT * FROM accounts WHERE email=?');
 const stmtGetAccountByNickname = db.prepare('SELECT * FROM accounts WHERE nickname=?');
 const stmtGetAccountById = db.prepare('SELECT * FROM accounts WHERE id=?');
+const stmtSetEmailVerified = db.prepare('UPDATE accounts SET email_verified=1 WHERE id=?');
 
 // ---- 棋手 ----
 const stmtInsertBot = db.prepare('INSERT INTO bots(account_id,name,avatar,created_at) VALUES(?,?,?,?)');
@@ -221,8 +233,8 @@ const stmtGetCurrentCode = db.prepare('SELECT * FROM code_versions WHERE bot_id=
 
 // ---- 场（battle，一场 = 双局）----
 const stmtInsertBattle = db.prepare(`
-  INSERT INTO battles(battle_url_id,challenger_bot_id,challenged_bot_id,result,ch_rp_delta,cd_rp_delta,played_at)
-  VALUES(?,?,?,?,?,?,?)`);
+  INSERT INTO battles(battle_url_id,challenger_bot_id,challenged_bot_id,result,ch_rp_delta,cd_rp_delta,scored,played_at)
+  VALUES(?,?,?,?,?,?,?,?)`);
 const stmtListBotBattles = db.prepare(`
   SELECT bt.*, cb.name AS challenger_name, db2.name AS challenged_name,
     cb.avatar AS challenger_avatar, db2.avatar AS challenged_avatar
@@ -283,6 +295,7 @@ module.exports = {
   getAccountByEmail: (email) => stmtGetAccountByEmail.get(email),
   getAccountByNickname: (nickname) => stmtGetAccountByNickname.get(nickname),
   getAccountById: (id) => stmtGetAccountById.get(id),
+  setEmailVerified: (accountId) => stmtSetEmailVerified.run(accountId),
 
   // 棋手
   createBot(accountId, name, avatar) {
@@ -333,8 +346,8 @@ module.exports = {
   getLatestPassedVersion(botId) { return stmtGetCurrentCode.get(botId, 'passed'); },
 
   // 场（一场 = 双局）
-  createBattle({ urlId: uid, challengerBotId, challengedBotId, result, chRpDelta, cdRpDelta }) {
-    const r = stmtInsertBattle.run(uid, challengerBotId, challengedBotId, result, chRpDelta, cdRpDelta, now());
+  createBattle({ urlId: uid, challengerBotId, challengedBotId, result, chRpDelta, cdRpDelta, scored = 1 }) {
+    const r = stmtInsertBattle.run(uid, challengerBotId, challengedBotId, result, chRpDelta, cdRpDelta, scored, now());
     return r.lastInsertRowid;
   },
   listBotBattles(botId, limit = 20) {

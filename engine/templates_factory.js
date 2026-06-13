@@ -7,9 +7,10 @@ const WIN = 1000000;
 const CENTER = new Set(['1,1', '2,1', '1,2', '2,2']);
 class Stop extends Error {}
  
-function safeApply(board, side, mv) {
-  if (Rules.remaining() < 1) throw new Stop();
-  return Rules.apply(board, side, mv);
+// R = 本手计量实例(game.rules)；apply 计点、remaining 自查余量
+function safeApply(R, board, side, mv) {
+  if (R.remaining() < 1) throw new Stop();
+  return R.apply(board, side, mv);
 }
 function counts(board) {
   let ns = 0, nk = 0;
@@ -60,7 +61,7 @@ function orderHint(board, side, mv) {
   }
   return h;
 }
-function negamax(board, side, depth, alpha, beta, ncm, prevPass, ply, evalFn) {
+function negamax(R, board, side, depth, alpha, beta, ncm, prevPass, ply, evalFn) {
   const verdict = Rules.judge(board, ncm);
   if (verdict) {
     if (verdict.winner === 'draw') return 0;
@@ -75,14 +76,14 @@ function negamax(board, side, depth, alpha, beta, ncm, prevPass, ply, evalFn) {
       const w = c.black > c.red ? 'black' : 'red';
       return w === side ? WIN - ply : -WIN + ply;
     }
-    return -negamax(board, Rules.other(side), depth - 1, -beta, -alpha, ncm + 1, true, ply + 1, evalFn);
+    return -negamax(R, board, Rules.other(side), depth - 1, -beta, -alpha, ncm + 1, true, ply + 1, evalFn);
   }
   moves.sort((a, b) => orderHint(board, side, b) - orderHint(board, side, a));
   let best = -Infinity;
   for (const mv of moves) {
-    const r = safeApply(board, side, mv);
+    const r = safeApply(R, board, side, mv);
     const nNcm = r.captured.length > 0 ? 0 : ncm + 1;
-    const v = -negamax(r.board, Rules.other(side), depth - 1, -beta, -alpha, nNcm, false, ply + 1, evalFn);
+    const v = -negamax(R, r.board, Rules.other(side), depth - 1, -beta, -alpha, nNcm, false, ply + 1, evalFn);
     if (v > best) best = v;
     if (v > alpha) alpha = v;
     if (alpha >= beta) break;
@@ -92,6 +93,7 @@ function negamax(board, side, depth, alpha, beta, ncm, prevPass, ply, evalFn) {
 function makeBot(name, evalFn) {
   const bot = { name, meta: { depthSum: 0, depthN: 0 } };
   bot.onTurn = function (me, opponent, game) {
+    const R = game.rules; // 本手计量实例
     const roots = game.legalMoves.slice();
     for (let i = roots.length - 1; i > 0; i--) {
       const j = Math.floor(game.random() * (i + 1));
@@ -103,9 +105,9 @@ function makeBot(name, evalFn) {
       let layerBest = null, layerV = -Infinity;
       try {
         for (const mv of roots) {
-          const r = safeApply(game.board, me.side, mv);
+          const r = safeApply(R, game.board, me.side, mv);
           const ncm = r.captured.length > 0 ? 0 : game.noCaptureMoves + 1;
-          const v = -negamax(r.board, opponent.side, depth - 1, -Infinity, Infinity, ncm, false, 1, evalFn);
+          const v = -negamax(R, r.board, opponent.side, depth - 1, -Infinity, Infinity, ncm, false, 1, evalFn);
           if (v > layerV) { layerV = v; layerBest = mv; }
         }
         best = layerBest; completed = depth;

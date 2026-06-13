@@ -193,7 +193,7 @@ function validateRegister() {
   if (pw2 && pw !== pw2) { errEl.textContent = '两次密码不一致'; errEl.classList.remove('ok'); }
   else if (pw2 && pw === pw2) { errEl.textContent = '密码一致 ✓'; errEl.classList.add('ok'); }
   else { errEl.textContent = ''; }
-  const ready = $('reg-nick').value.trim() && emailOk && pw.length >= 8 && pw === pw2;
+  const ready = $('reg-nick').value.trim() && emailOk && pw.length >= 8 && pw.length <= 256 && pw === pw2;
   $('regBtn').disabled = !ready;
 }
 ['reg-nick','reg-email','reg-pw','reg-pw2'].forEach((id) => $(id).addEventListener('input', () => { validateRegister(); if (id === 'reg-nick') $('err-nick').textContent = ''; }));
@@ -201,7 +201,13 @@ function validateRegister() {
 $('regBtn').addEventListener('click', async () => {
   const body = { nickname: $('reg-nick').value.trim(), email: $('reg-email').value.trim(), password: $('reg-pw').value };
   const r = await apiFetch('POST', '/api/account/register', body);
-  if (r.ok) { closeModal('authModal'); await refreshMe(); showTab('mybot'); toast('注册成功，来创建棋手吧'); return; }
+  if (r.ok) {
+    closeModal('authModal'); await refreshMe(); showTab('mybot');
+    toast('注册成功，来创建棋手吧');
+    // 提示验证邮箱（正式挑战前需完成）；演示环境直接给出验证链接
+    if (r.emailVerified === false) showVerifyLink(r.verifyUrl);
+    return;
+  }
   if (r.field === 'nickname') { $('err-nick').textContent = r.error; return; }
   if (r.field === 'email') {
     popup({ icon: '✉', title: '该邮箱已注册', text: '你可以直接登录，或换一个邮箱注册新账号。', actions: [
@@ -223,17 +229,46 @@ $('loginBtn').addEventListener('click', async () => {
 // ============================================================
 // 我的棋手
 // ============================================================
+function verifyBannerHtml() {
+  if (!(ME && ME.account) || ME.emailVerified !== false) return '';
+  return `<div class="warn-box verify-banner" style="margin-bottom:14px">
+    ⚠ 邮箱未验证：发起<b>正式挑战</b>需先验证邮箱（${esc(ME.account.email)}）。
+    <button class="mini" id="resendVerifyBtn" style="margin-left:8px">重新发送验证邮件</button>
+  </div>`;
+}
+function bindVerifyBanner() {
+  const btn = $('resendVerifyBtn');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    const r = await apiFetch('POST', '/api/account/resend-verification');
+    if (!r.ok) return toast(r.error || '发送失败');
+    if (r.emailVerified) { toast('邮箱已验证'); await refreshMe(); renderMyBot(); return; }
+    showVerifyLink(r.verifyUrl);
+  });
+}
+// 演示环境：服务端直接回链接 → 弹窗给出可点击链接；生产环境走真实邮件
+function showVerifyLink(verifyUrl) {
+  if (verifyUrl) {
+    popup({ icon: '✉', title: '验证邮件已发送', text: '演示环境：点击下方链接完成验证。', actions: [
+      { label: '打开验证链接', primary: true, onClick: () => window.open(verifyUrl, '_blank') },
+      { label: '关闭' },
+    ] });
+  } else {
+    toast('验证邮件已发送，请查收邮箱');
+  }
+}
 function renderMyBot() {
   const box = $('mybotBody');
   if (!(ME && ME.account)) { box.innerHTML = '<div class="empty-hero"><h2>请先登录</h2><p>登录后即可创建并管理你的棋手。</p></div>'; return; }
   if (!ME.hasBot) {
-    box.innerHTML = `<div class="empty-hero"><h2>你还没有棋手</h2><p>创建一名棋手，拿到它的棋手密钥，交给你的 Agent 来编写策略。</p><button class="primary" id="createBotOpen">创建棋手 →</button></div>`;
+    box.innerHTML = verifyBannerHtml() + `<div class="empty-hero"><h2>你还没有棋手</h2><p>创建一名棋手，拿到它的棋手密钥，交给你的 Agent 来编写策略。</p><button class="primary" id="createBotOpen">创建棋手 →</button></div>`;
+    bindVerifyBanner();
     $('createBotOpen').addEventListener('click', openCreateBot);
     return;
   }
   const b = ME.bot;
   const empty = b.currentVersion === 0;
-  box.innerHTML = `
+  box.innerHTML = verifyBannerHtml() + `
     <div class="bot-card">
       <div class="av">${avatarHtml(b.avatar)}</div>
       <div class="grow">
@@ -243,6 +278,7 @@ function renderMyBot() {
       </div>
       <div class="actions"><button class="primary" id="goDetail">详情</button></div>
     </div>`;
+  bindVerifyBanner();
   $('goDetail').addEventListener('click', () => showDetail());
 }
 
@@ -468,9 +504,11 @@ async function viewCode(version) {
 const RES_LABEL = { win: '胜', loss: '负', draw: '平' };
 const RES_CLS = { win: 'passed', loss: 'failed', draw: 'pending' };
 function battleCardHtml(b) {
-  const rp = b.rpDelta == null
-    ? '<span class="rp-delta">RP —</span>'
-    : `<span class="rp-delta ${b.rpDelta >= 0 ? 'up' : 'down'}">RP ${b.rpDelta >= 0 ? '+' : ''}${b.rpDelta}</span>`;
+  const rp = b.scored === 0
+    ? '<span class="rp-delta practice">练习赛·不计分</span>'
+    : b.rpDelta == null
+      ? '<span class="rp-delta">RP —</span>'
+      : `<span class="rp-delta ${b.rpDelta >= 0 ? 'up' : 'down'}">RP ${b.rpDelta >= 0 ? '+' : ''}${b.rpDelta}</span>`;
   const games = b.games.map((g) =>
     `<span class="game-pill ${RES_CLS[g.result]}">第${g.gameNo}局·执${g.mySide === 'black' ? '黑' : '红'} ${RES_LABEL[g.result]}</span>`
   ).join('');

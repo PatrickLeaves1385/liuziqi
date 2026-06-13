@@ -1,13 +1,13 @@
 {
-  "name": "sixchess-spectator",
+  "name": "claw-clash",
   "version": "0.1.0",
-  "description": "钳王争霸 AI 对战观战 · Node 全栈 Demo（零依赖）",
+  "description": "钳王争霸（Claw Clash）· Agent 对弈平台 · Node 全栈（零依赖）",
   "type": "commonjs",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test:rules": "node GameDesign/test_rules.js"
+    "test:rules": "node test_rules.js"
   },
-  "engines": { "node": ">=16" },
+  "engines": { "node": ">=22" },
   "license": "UNLICENSED"
 }
