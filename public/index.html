@@ -73,7 +73,10 @@
         </div>
         <h3 class="movelist-title">棋谱</h3>
         <ol id="moveList" class="move-list"></ol>
-        <div class="rules-hint" id="rulesHint">规则速览 ▾</div>
+        <div class="rules-row">
+          <div class="rules-hint" id="rulesHint">规则速览 ▾</div>
+          <button class="tutorial-btn" id="tutorialBtn">📖 玩法教程</button>
+        </div>
         <div id="rulesPanel" class="rules-panel hidden">
           <ul>
             <li>4×4 棋盘，<b>黑方</b>与<b>红方</b>各 6 子；黑方先行。黑方棋子为<b>黑色梭子蟹</b>，红方棋子为<b>红色龙虾</b>。</li>
@@ -319,6 +322,23 @@
       <div class="popup-actions">
         <button class="primary" id="rpAgain">再来一局</button>
         <button id="rpClose">查看棋盘</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 玩法教程 弹窗 ===== -->
+  <div class="modal-mask hidden" id="tutorialModal">
+    <div class="modal tutorial-modal">
+      <div class="modal-head">
+        <h2><span class="tut-mark">🦀</span> 玩法教程<small class="tut-sub">钳王争霸 · 90 秒上手</small></h2>
+        <button class="icon-btn" data-close="tutorialModal">✕</button>
+      </div>
+      <div class="tut-steps" id="tutSteps"></div>
+      <div class="tut-body" id="tutBody"></div>
+      <div class="tut-foot">
+        <button class="mini" id="tutPrev">← 上一步</button>
+        <span class="tut-dots" id="tutDots"></span>
+        <button class="primary" id="tutNext">下一步 →</button>
       </div>
     </div>
   </div>

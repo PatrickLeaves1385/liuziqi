@@ -1099,6 +1099,90 @@ document.addEventListener('keydown',(e)=>{
 
 $('rulesHint').addEventListener('click',()=>$('rulesPanel').classList.toggle('hidden'));
 
+// ============================================================
+// 玩法教程弹窗（迷你棋盘复用 tokenSvg，示例取自吃子规则）
+// ============================================================
+function tutCellCenter(x,y){return [8+x*46+21, 8+(3-y)*46+21];} // 迷你棋盘 196px：padding 8 + 格 42 + 间隙 4
+function tutArrowSvg(from,to,id){
+  const[x1,y1]=tutCellCenter(from[0],from[1]),[x2,y2]=tutCellCenter(to[0],to[1]);
+  return `<svg class="mb-arrow" width="196" height="196" viewBox="0 0 196 196"><defs><marker id="${id}" markerWidth="9" markerHeight="9" refX="6" refY="4.5" orient="auto"><path d="M0 0 L9 4.5 L0 9 z" fill="var(--mint-dp)"/></marker></defs><line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="var(--mint-dp)" stroke-width="4" stroke-linecap="round" stroke-dasharray="2 7" marker-end="url(#${id})"/></svg>`;
+}
+function miniBoardHtml(cfg,id){
+  const has=(arr,x,y)=>arr&&arr.some((p)=>p[0]===x&&p[1]===y);
+  let cells='';
+  for(let y=3;y>=0;y--)for(let x=0;x<4;x++){
+    let cls='mb-cell'+((x+y)%2?' alt':'');
+    if(has(cfg.pairRed,x,y))cls+=' pair-red';
+    if(has(cfg.pair,x,y))cls+=' pair';
+    if(cfg.ring&&cfg.ring[0]===x&&cfg.ring[1]===y)cls+=' ring';
+    const v=cfg.layout[x+','+y];
+    let inner=v?`<div class="mb-token">${tokenSvg(v)}</div>`:'';
+    if(has(cfg.captured,x,y))inner+='<div class="mb-cap">✕</div>';
+    if(cfg.banned&&cfg.banned[0]===x&&cfg.banned[1]===y)inner+='<div class="mb-safe">🛡️</div>';
+    cells+=`<div class="${cls}">${inner}</div>`;
+  }
+  return `<div class="mini-board-wrap"><div class="mini-board">${cells}</div>${cfg.arrow?tutArrowSvg(cfg.arrow[0],cfg.arrow[1],id):''}</div>`;
+}
+const TUT_EX=[
+  {n:1,title:'基本吃子',sideTag:'黑方走子',sideCls:'black',
+   before:{layout:{'0,1':'black','1,2':'black','2,1':'red'},arrow:[[1,2],[1,1]]},
+   after:{layout:{'0,1':'black','1,1':'black'},ring:[1,1],pair:[[0,1],[1,1]],captured:[[2,1]]},
+   capB:'黑方梭子蟹从 (1,2) 移到 (1,1)。',
+   capA:'落子后只看新位置的横线 y=1：黑方 2 连「(0,1)(1,1)」+ 相邻一颗红子 → 吃掉 (2,1) 的红子。'},
+  {n:2,title:'送上门不吃',sideTag:'黑方走子',sideCls:'black',
+   before:{layout:{'1,1':'red','2,1':'red','0,2':'black'},arrow:[[0,2],[0,1]]},
+   after:{layout:{'0,1':'black','1,1':'red','2,1':'red'},ring:[0,1],pairRed:[[1,1],[2,1]],banned:[0,1]},
+   capB:'红方已有 2 连「(1,1)(2,1)」，黑方主动把子移到旁边的 (0,1)。',
+   capA:'虽凑成「红 2 连 + 黑 1 子」，但吃子只由“走棋方”触发。本手是黑走，黑自己的 (0,1) 不会被吃——送上门不吃。'},
+  {n:3,title:'双线同吃',sideTag:'红方走子',sideCls:'red',
+   before:{layout:{'1,0':'red','0,1':'red','1,2':'red','2,1':'black','1,3':'black'},arrow:[[1,0],[1,1]]},
+   after:{layout:{'1,1':'red','0,1':'red','1,2':'red'},ring:[1,1],pair:[[0,1],[1,1],[1,2]],captured:[[2,1],[1,3]]},
+   capB:'红方龙虾从 (1,0) 移到中央的 (1,1)。',
+   capA:'只结算新位置 (1,1)：横线吃 (2,1)、竖线吃 (1,3)，一步吃 2 子。单手至多 2 子、不连锁。'}
+];
+const TUT_STEPS=[
+  {title:'棋盘与目标',body:`<p class="tut-p"><b>4×4 棋盘</b>，黑方<b>梭子蟹</b> vs 红方<b>龙虾</b>，各 6 子，黑方先行。<br>坐标 (x, y) 以<b>左下角为原点 (0,0)</b>，右上角 (3,3)。<br><br><b>目标：</b>把对手吃到只剩 ≤1 子，或在子力裁定时领先对方。</p>`},
+  {title:'怎么走',body:`<p class="tut-p">每一手，选自己的一颗棋子，沿<b>横向或纵向</b>移动到<b>相邻的空格</b>。<br><br>· 一次只走一格　· 不能斜走　· 不能跨过其它棋子<br>· 无子可动时由系统自动停一手（pass）</p>`},
+  {title:'吃子规则',body:null},
+  {title:'胜负判定',body:`<p class="tut-p"><b>吃光取胜：</b>对手 ≤1 子 → 你胜（eliminated）。<br><b>子力裁定：</b>连续 20 手无吃子 → 比子数，<b>领先 1 子即胜</b>（material）。<br><b>互停裁定：</b>双方连续停手 → 按子力裁定（stalemate）。</p>`}
+];
+let tutCur=0;
+const tutShown=[false,false,false];
+function tutRenderExample(i){
+  const ex=TUT_EX[i];
+  $('exBoard'+i).innerHTML=miniBoardHtml(tutShown[i]?ex.after:ex.before,'mk'+i);
+  $('exCap'+i).innerHTML=(tutShown[i]?'<b class="cap-after">走子后 → </b>':'<b class="cap-before">走子前 · </b>')+(tutShown[i]?ex.capA:ex.capB);
+  const btn=document.querySelector('.tut-play[data-ex="'+i+'"]');
+  if(btn)btn.textContent=tutShown[i]?'↺ 重置':'▶ 演示走子';
+}
+function tutCaptureHtml(){
+  let s=`<div class="tut-card tut-tip"><p>💡 <b>核心口诀：</b>落子后只看<b>新位置</b>的横线和竖线；凑成「<b>己方 2 连 + 紧邻对方 1 子</b>」就吃掉那 1 子。双线可同吃（单手至多 2 子）、<b>不连锁</b>、<b>送上门不吃</b>。</p></div>`;
+  TUT_EX.forEach((ex,i)=>{s+=`<div class="tut-card ex-card"><div class="ex-head"><span class="ex-no">${ex.n}</span><b>${ex.title}</b><span class="ex-tag ${ex.sideCls}">${ex.sideTag}</span></div><div class="ex-body"><div class="ex-board" id="exBoard${i}"></div><div class="ex-right"><p class="ex-cap" id="exCap${i}"></p><button class="tut-play" data-ex="${i}">▶ 演示走子</button></div></div></div>`;});
+  return s;
+}
+function tutRenderStep(){
+  $('tutBody').innerHTML=tutCur===2?tutCaptureHtml():`<div class="tut-card">${TUT_STEPS[tutCur].body}</div>`;
+  document.querySelectorAll('#tutSteps .tut-chip').forEach((c,i)=>c.classList.toggle('on',i===tutCur));
+  $('tutDots').textContent=(tutCur+1)+' / '+TUT_STEPS.length;
+  $('tutPrev').style.visibility=tutCur===0?'hidden':'visible';
+  $('tutNext').textContent=tutCur===TUT_STEPS.length-1?'开始试玩 ✓':'下一步 →';
+  if(tutCur===2){
+    [0,1,2].forEach((i)=>{tutShown[i]=false;tutRenderExample(i);});
+    document.querySelectorAll('.tut-play').forEach((b)=>b.addEventListener('click',()=>{const i=+b.dataset.ex;tutShown[i]=!tutShown[i];tutRenderExample(i);}));
+  }
+}
+const TUT_SEEN_KEY='clawclash_tut_seen';
+function tutSeen(){try{return localStorage.getItem(TUT_SEEN_KEY);}catch{return true;}} // 隐私模式不可用时视作已看，不闪
+function tutMarkSeen(){try{localStorage.setItem(TUT_SEEN_KEY,'1');}catch{}}
+function tutInit(){
+  $('tutSteps').innerHTML=TUT_STEPS.map((s,i)=>`<button class="tut-chip" data-i="${i}">${['①','②','③','④'][i]} ${s.title}</button>`).join('');
+  document.querySelectorAll('#tutSteps .tut-chip').forEach((c)=>c.addEventListener('click',()=>{tutCur=+c.dataset.i;tutRenderStep();}));
+  $('tutPrev').addEventListener('click',()=>{if(tutCur>0){tutCur--;tutRenderStep();}});
+  $('tutNext').addEventListener('click',()=>{if(tutCur<TUT_STEPS.length-1){tutCur++;tutRenderStep();}else closeModal('tutorialModal');});
+  $('tutorialBtn').addEventListener('click',()=>{$('tutorialBtn').classList.remove('pulse');tutMarkSeen();tutCur=0;openModal('tutorialModal');tutRenderStep();});
+  if(!tutSeen())$('tutorialBtn').classList.add('pulse'); // 首次访问脉冲提示，打开一次后不再闪
+}
+
 async function loadTemplates(){
   const data=await apiFetch('GET','/api/templates');
   const opt=(t)=>`<option value="${esc(t.name)}" title="${esc(t.summary)}">${esc(t.name)} — ${esc(t.summary)}</option>`;
@@ -1115,6 +1199,7 @@ async function loadTemplates(){
 (async function init(){
   buildBoardCells();
   buildReplayCells();
+  tutInit();
   state.frames=buildFrames(initialBoard(),[]);
   state.cur=0;renderFrame();
   await refreshMe();

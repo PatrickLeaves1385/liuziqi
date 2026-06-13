@@ -245,6 +245,52 @@ select:focus,input:focus,textarea:focus { outline:none; border-color:var(--mint)
 .popup-actions { display:flex; gap:10px; margin-top:18px; }
 .popup-actions button { flex:1; }
 
+/* ---- 玩法教程入口 + 弹窗 ---- */
+.rules-row { display:flex; align-items:center; gap:10px; margin-top:12px; }
+.rules-row .rules-hint { margin-top:0; }
+.tutorial-btn { margin-left:auto; background:var(--mint-soft); color:var(--mint-ink); border-color:var(--mint-soft); font-size:13px; padding:7px 14px; }
+.tutorial-btn:hover:not(:disabled) { background:var(--mint); color:var(--mint-ink); border-color:var(--mint); }
+.tutorial-btn.pulse { animation:tutPulse 1.6s ease-in-out infinite; }
+.tutorial-btn.pulse:hover { animation:none; }
+@keyframes tutPulse { 0%,100% { box-shadow:0 0 0 0 rgba(111,214,196,.6); } 50% { box-shadow:0 0 0 8px rgba(111,214,196,0); } }
+.tutorial-modal { width:660px; max-width:96vw; }
+.tut-mark { font-size:22px; vertical-align:-2px; margin-right:4px; }
+.tut-sub { font-size:13px; color:var(--muted); font-weight:500; margin-left:8px; }
+.tut-steps { display:flex; gap:8px; flex-wrap:wrap; margin:12px 0 4px; }
+.tut-chip { font-size:13px; font-weight:600; padding:6px 13px; border-radius:999px; border:1.5px solid var(--line2); background:var(--card); color:var(--muted); }
+.tut-chip.on { background:var(--mint-soft); color:var(--mint-ink); border-color:var(--mint-soft); }
+.tut-card { background:var(--card); border:1.5px solid var(--line); border-radius:16px; padding:14px; margin-top:12px; }
+.tut-tip { background:rgba(191,233,223,.32); border-color:var(--mint-soft); }
+.tut-tip p { margin:0; font-size:13.5px; line-height:1.7; color:var(--mint-ink); }
+.tut-tip b { color:var(--mint-ink); }
+.tut-p { font-size:14px; line-height:1.85; margin:0; color:var(--muted); }
+.tut-p b { color:var(--ink); }
+.ex-head { display:flex; align-items:center; gap:8px; margin-bottom:10px; }
+.ex-no { width:22px; height:22px; border-radius:50%; background:var(--mint); color:var(--mint-ink); font-size:13px; font-weight:800; display:flex; align-items:center; justify-content:center; flex:0 0 auto; }
+.ex-tag { font-size:12px; font-weight:700; padding:2px 10px; border-radius:999px; }
+.ex-tag.black { background:#e7ecef; color:var(--black-edge); }
+.ex-tag.red { background:#f7dcd8; color:var(--red-edge); }
+.ex-body { display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap; }
+.ex-right { flex:1; min-width:190px; }
+.ex-cap { font-size:13.5px; line-height:1.7; margin:0 0 12px; color:var(--ink); }
+.cap-before { color:var(--muted); }
+.cap-after { color:var(--mint-dp); }
+.tut-play { font-size:13px; }
+.tut-foot { display:flex; align-items:center; gap:10px; margin-top:16px; }
+.tut-dots { margin:0 auto; font-size:12px; color:var(--muted); }
+.mini-board-wrap { position:relative; width:196px; height:196px; flex:0 0 auto; }
+.mini-board { width:196px; height:196px; background:rgba(150,212,240,.5); border-radius:14px; padding:8px; display:grid; grid-template-columns:repeat(4,1fr); grid-template-rows:repeat(4,1fr); gap:4px; }
+.mb-cell { position:relative; border-radius:9px; display:flex; align-items:center; justify-content:center; background:rgba(255,255,255,.6); }
+.mb-cell.alt { background:rgba(232,247,255,.55); }
+.mb-cell.pair { box-shadow:inset 0 0 0 3px rgba(111,214,196,.95); }
+.mb-cell.pair-red { box-shadow:inset 0 0 0 3px #b4b2a9; }
+.mb-cell.ring { box-shadow:inset 0 0 0 3px var(--mint-dp); }
+.mb-token { width:84%; height:84%; filter:drop-shadow(0 2px 2px rgba(47,72,88,.22)); }
+.mb-token svg { width:100%; height:100%; display:block; }
+.mb-cap { position:absolute; font-size:26px; font-weight:800; color:var(--coral); }
+.mb-safe { position:absolute; top:0; right:1px; font-size:13px; }
+.mb-arrow { position:absolute; inset:0; pointer-events:none; }
+
 /* ---- Guide ---- */
 .guide-content h3 { color:var(--mint-dp); margin-top:24px; margin-bottom:8px; }
 .guide-content ol,.guide-content ul { color:var(--muted); line-height:1.9; padding-left:20px; }
