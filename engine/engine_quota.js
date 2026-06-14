@@ -4,6 +4,7 @@
 // - 无合法走法由引擎自动 pass(计入 noCaptureMoves),连续互停 → stalemate 按子力裁定
 // - illegal / error / runtime(超点)立即判负
 const { Rules, makeRules } = require('./rules_metered');
+const { initBoard } = require('./rules_core'); // 开局布局：与前端共享同一事实源
 
 function mulberry32(a) {
   return function () {
@@ -12,13 +13,6 @@ function mulberry32(a) {
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
-}
-
-function initBoard() {
-  const b = Array.from({ length: 4 }, () => Array(4).fill(null));
-  for (const [x, y] of [[0, 3], [1, 3], [2, 3], [3, 3], [0, 2], [3, 2]]) b[x][y] = 'black';
-  for (const [x, y] of [[0, 0], [1, 0], [2, 0], [3, 0], [0, 1], [3, 1]]) b[x][y] = 'red';
-  return b;
 }
 
 function piecesOf(board, side) {

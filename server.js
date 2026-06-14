@@ -8,6 +8,10 @@ const crypto = require('crypto');
 
 const { initBoard } = require('./engine/engine_quota');
 const execpool = require('./engine/execpool'); // 不可信对局/烟雾/试玩 → 隔离子进程执行
+const { runPlay: runPlaySession } = require('./engine/play_session'); // 试玩重放/推进核心
+const { findBuiltin } = require('./engine/builtins'); // 内置对手（流派/训练棋手）构造
+// 前端「本地落子」加载的共享规则核心源码（与服务器重放走同一套规则，见 /game-rules.js 路由）
+const RULES_CORE_JS = fs.readFileSync(path.join(__dirname, 'engine', 'rules_core.js'), 'utf8');
 const db = require('./db');
 const auth = require('./auth');
 const rl = require('./ratelimit');
@@ -46,7 +50,21 @@ function sendJson(res, code, obj, extraHeaders) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', ...(extraHeaders || {}) });
   res.end(body);
 }
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
+const MIME = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+  '.webp': 'image/webp', '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
+};
+const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico']);
+// 协商缓存：内容哈希 ETag。命中 If-None-Match 回 304（不传体），未命中回 200 带 ETag。
+function etagOf(data) { return '"' + crypto.createHash('sha1').update(data).digest('base64') + '"'; }
+function sendCached(req, res, data, contentType, cacheControl) {
+  const etag = etagOf(data);
+  const headers = { 'Content-Type': contentType, 'Cache-Control': cacheControl, ETag: etag };
+  if (req.headers['if-none-match'] === etag) { res.writeHead(304, headers); return res.end(); }
+  res.writeHead(200, headers);
+  res.end(data);
+}
 function serveStatic(req, res) {
   let p = decodeURIComponent(req.url.split('?')[0]);
   if (p === '/') p = '/index.html';
@@ -54,8 +72,11 @@ function serveStatic(req, res) {
   if (!fp.startsWith(PUBLIC_DIR)) { res.writeHead(403); return res.end('Forbidden'); }
   fs.readFile(fp, (err, data) => {
     if (err) { res.writeHead(404); return res.end('Not Found'); }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(fp)] || 'application/octet-stream' });
-    res.end(data);
+    const ext = path.extname(fp);
+    // 代码/页面（html/js/css）走 no-cache：每次校验、部署后即时生效，绝不发旧 app.js（未变仍 304 省体）；
+    // 头像等图片短缓存：URL 同名覆盖时 ETag 会变、过期后也走 304，≤5min 的旧图无伤大雅。
+    const cacheControl = IMAGE_EXT.has(ext) ? 'public, max-age=300' : 'no-cache';
+    sendCached(req, res, data, MIME[ext] || 'application/octet-stream', cacheControl);
   });
 }
 function readBody(req) {
@@ -250,9 +271,18 @@ route('POST', '/api/play', async (req, res, _m, body) => {
     }
   }
   const spec = { mode: body.mode, humanSide: body.humanSide, history: body.history, opponent };
+  // 信任分流：仅「玩家上传脚本(botId)」是不可信代码，须 fork 隔离子进程；
+  // 「内置流派/训练棋手/双人同屏」全为本仓库可信代码，主进程内直接推进，省掉每步 fork 冷启动。
+  // （前端方案 A 落地后，人类自己这步已在浏览器本地即时落子，主进程这条只用于内置对手应手。）
+  const untrusted = !!opponent && opponent.kind === 'bot';
   let r;
   try {
-    r = await execpool.runPlay(spec, 'ip:' + clientIp(req));
+    if (untrusted) {
+      r = await execpool.runPlay(spec, 'ip:' + clientIp(req));
+    } else {
+      // makeBot 仅在 opp.kind==='bot' 时被调用——此分支不会触达，置守卫确保绝不在主进程载入用户脚本
+      r = runPlaySession(spec, { findBuiltin, makeBot() { throw new Error('in-process play path must not load user scripts'); } });
+    }
   } catch (e) {
     return sendJson(res, e && e.busy ? 503 : 500, { ok: false, error: e && e.busy ? '试玩执行繁忙，请稍后重试' : '试玩执行失败' });
   }
@@ -972,6 +1002,13 @@ route('GET', '/agent-guide', (req, res) => {
   res.end(AGENT_GUIDE_MD);
 });
 
+// 共享规则核心（前端「本地落子」用）。源文件在 engine/rules_core.js，启动时读入。
+// 与服务器重放/裁定同一套规则——前后端规则必须一致，故走 no-cache 协商缓存：
+// 一旦部署改了规则即时生效，杜绝「旧 game-rules.js 与新服务器规则不一致」导致的本地落子分歧。
+route('GET', '/game-rules.js', (req, res) => {
+  sendCached(req, res, RULES_CORE_JS, 'text/javascript; charset=utf-8', 'no-cache');
+});
+
 // ============================================================
 // 启动
 // ============================================================
@@ -980,6 +1017,11 @@ const server = http.createServer(async (req, res) => {
   try { await dispatch(req, res); }
   catch (e) { sendJson(res, 500, { ok: false, error: String(e?.message || e) }); }
 });
+// 长连接调优（方案 C）：保持 HTTP keep-alive，避免试玩每步走子都重建 TCP/TLS。
+// keepAliveTimeout 略大于反代（Nginx 默认 upstream keepalive 60s），headersTimeout 再大一档，
+// 防止「反代复用的连接被 Node 先行关闭」导致偶发 502/重连。
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
 
 server.listen(PORT, () => {
   console.log(`钳王争霸 Agent 平台已启动: http://localhost:${PORT}`);

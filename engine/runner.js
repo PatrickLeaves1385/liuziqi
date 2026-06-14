@@ -3,20 +3,11 @@
 // 父进程经 IPC 下发一个任务，本进程跑完回传结果即退出（fork-per-task）。
 // 安全：本进程 env 已被父进程剥离机密；但 vm 逃逸后仍可读文件系统——须靠 OS 级隔离（见 SECURITY.md）。
 const { playMatch } = require('./engine_quota');
-const { makeTemplates } = require('./templates_factory');
-const { TRAINING_BOTS } = require('./training_bots');
 const { makeBot } = require('./sandbox');
 const { runSmokeTests } = require('./smoke');
 const { runPlay } = require('./play_session');
+const { findBuiltin } = require('./builtins'); // 内置对手构造（与主进程试玩快路径共用）
 
-// 定稿基线权重（§14.4）——试玩内置对手（流派）用
-const WEIGHTS = { blockMob: 60, rulDef: 8, cenThreat: 15, cenCenter: 50, cenHunt: 4, cenMat: 1000 };
-function findBuiltin(name) {
-  const t = makeTemplates(WEIGHTS).find((b) => b.name === name);
-  if (t) return t;
-  const def = TRAINING_BOTS.find((d) => d.make().name === name);
-  return def ? def.make() : null;
-}
 function pick(g) { return { winner: g.winner, reason: g.reason, turns: g.turns, history: g.history, finalPieces: g.finalPieces }; }
 
 function handle(task) {

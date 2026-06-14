@@ -7,13 +7,8 @@ const SMOKE_LABEL = { passed: '已通过', failed: '未通过', pending: '测试
 
 let ME = null; // { account, hasBot, bot } | null
 
-// 开局布局（与引擎 initBoard 一致）
-function initialBoard() {
-  const b = Array.from({ length: 4 }, () => Array(4).fill(null));
-  for (const [x, y] of [[0,3],[1,3],[2,3],[3,3],[0,2],[3,2]]) b[x][y] = 'black';
-  for (const [x, y] of [[0,0],[1,0],[2,0],[3,0],[0,1],[3,1]]) b[x][y] = 'red';
-  return b;
-}
+// 开局布局：直接取共享规则核心（/game-rules.js，与服务器同一事实源）
+function initialBoard() { return GameRules.initBoard(); }
 
 // ============================================================
 // 段位
@@ -703,6 +698,7 @@ function updateStatusLine(){
     return;
   }
   banner.className='result-banner hidden';
+  if(play.busy&&play.mode!=='local'){ $('statusLine').textContent='你已落子，对手思考中…'; return; }
   if(play.mode==='local'){
     const nm=play.toMove==='black'?play.p1:play.p2;
     $('statusLine').textContent=play.sel?'点击高亮格完成走子，或点其他棋子换选':`轮到 ${SIDE_LABEL[play.toMove]||''} · ${nm}：点击棋子走子`;
@@ -810,14 +806,17 @@ function paintPlayHints(){
     for(const m of play.legal)if(m.from[0]===play.sel[0]&&m.from[1]===play.sel[1])cellAt(m.to[0],m.to[1])?.classList.add('hint');
   }
 }
-async function postPlay(history,{animate}={}){
-  play.busy=true;updateUndoBtn();
-  const prevFrames=state.frames.length;
-  const payload=play.mode==='local'
-    ?{mode:'local',history}
-    :{humanSide:play.humanSide,history,...(play.opp.type==='bot'?{botId:play.opp.botId}:{template:play.opp.name})};
-  const r=await apiFetch('POST','/api/play',payload);
-  if(!r.ok){play.busy=false;updateUndoBtn();toast(r.error||'走子失败');return null;}
+// ---- 走子结果应用（服务器应手 与 前端本地推演 共用，payload 结构一致）----
+function buildPlayMatch(r){
+  if(play.mode==='local')
+    return {blackName:play.p1,redName:play.p2,winner:r.status.winner,reason:r.status.reason,turns:r.status.turns,history:r.history};
+  return {
+    blackName:play.humanSide==='black'?'你':play.opp.name,
+    redName:play.humanSide==='red'?'你':play.opp.name,
+    winner:r.status.winner,reason:r.status.reason,turns:r.status.turns,history:r.history,
+  };
+}
+function applyPlayResult(r,{animate=false,prevFrames=0}={}){
   play.history=r.history;
   play.legal=r.legalMoves;
   play.over=r.status.over;
@@ -828,29 +827,85 @@ async function postPlay(history,{animate}={}){
     play.toMove=play.over?null:play.humanSide;
   }
   play.sel=null;
-  state.match=play.mode==='local'
-    ?{blackName:play.p1,redName:play.p2,winner:r.status.winner,reason:r.status.reason,turns:r.status.turns,history:r.history}
-    :{
-      blackName:play.humanSide==='black'?'你':play.opp.name,
-      redName:play.humanSide==='red'?'你':play.opp.name,
-      winner:r.status.winner,reason:r.status.reason,turns:r.status.turns,
-      history:r.history,
-    };
+  state.match=buildPlayMatch(r);
   state.frames=buildFrames(r.initialBoard,r.history);
   renderMoveList();
+  // AI 模式：本地推演停在「该机器人应手」(needBot) 且未终局 → 保持忙碌，等服务器权威应手再解锁
+  const keepBusy=play.mode!=='local'&&!!r.needBot&&!r.status.over;
+  const finalize=()=>{ if(!keepBusy)play.busy=false; updateUndoBtn(); renderFrame(); maybeShowResult(); };
   if(animate&&state.frames.length>prevFrames&&prevFrames>0){
-    // 逐帧播放新增着法（人类落子 → 机器人应手）
+    // 逐帧播放新增着法（机器人应手 / 多步序列）
     let i=prevFrames-1;
     const stepAnim=()=>{
       i++;state.cur=Math.min(i,state.frames.length-1);renderFrame();
       if(i<state.frames.length-1)setTimeout(stepAnim,380);
-      else{play.busy=false;updateUndoBtn();renderFrame();maybeShowResult();}
+      else finalize();
     };
     stepAnim();
   }else{
     state.cur=state.frames.length-1;
-    play.busy=false;updateUndoBtn();renderFrame();maybeShowResult();
+    finalize();
   }
+}
+
+// ---- 前端本地推演：复刻 engine/play_session.js，与服务器共享 /game-rules.js 规则核心 ----
+// 「机器人应手」留给服务器（沙箱执行不可信脚本）：AI 模式推进到机器人回合即停下标记 needBot；
+// local（双人同屏）模式整局自洽，全程无需服务器。
+function runLocalPlay(rawHistory, mode, humanSide){
+  let board=GameRules.initBoard();
+  let side='black', turn=1, ncm=0, lastPass=false;
+  const history=[]; let status=null, needBot=false;
+  const finish=(w,rs)=>{status={winner:w,reason:rs};};
+  function applyStep(mv){
+    const r=GameRules.apply(board,side,mv);
+    board=r.board; ncm=r.captured.length>0?0:ncm+1;
+    history.push({turn,side,from:mv.from.slice(),to:mv.to.slice(),captured:r.captured,pass:false});
+    lastPass=false; turn++;
+    const v=GameRules.judge(board,ncm);
+    if(v)finish(v.winner,v.reason); else side=GameRules.other(side);
+  }
+  function applyPass(){
+    history.push({turn,side,from:null,to:null,captured:[],pass:true});
+    ncm++;
+    if(lastPass){const c=GameRules.counts(board);finish(c.black===c.red?'draw':(c.black>c.red?'black':'red'),c.black===c.red?'draw':'stalemate');return;}
+    lastPass=true; turn++;
+    const v=GameRules.judge(board,ncm);
+    if(v)finish(v.winner,v.reason); else side=GameRules.other(side);
+  }
+  for(const h of (rawHistory||[])){
+    if(status)break;
+    if(h.pass)applyPass(); else applyStep({from:h.from,to:h.to});
+  }
+  while(!status){
+    const moves=GameRules.legalMoves(board,side);
+    if(moves.length===0){applyPass();continue;} // 无合法走法自动停一手
+    if(mode==='local'||side===humanSide)break;  // 轮到人类，停下等输入
+    needBot=true; break;                         // AI 模式：轮到机器人，交给服务器
+  }
+  const toMove=status?null:(mode==='local'?side:humanSide);
+  const legal=(status||needBot)?[]:GameRules.legalMoves(board,toMove);
+  return {
+    ok:true, mode, humanSide, toMove, needBot,
+    initialBoard:GameRules.initBoard(), history, board, counts:GameRules.counts(board),
+    legalMoves:legal,
+    status: status?{over:true,winner:status.winner,reason:status.reason,turns:history.length}:{over:false,turns:history.length},
+  };
+}
+// 本地推演 + 渲染（双人同屏全程、AI 人类落子即时反馈、悔棋回放都走这里，零网络）
+function localApply(history,{animate=false}={}){
+  const prevFrames=state.frames.length;
+  const r=runLocalPlay(history, play.mode, play.humanSide);
+  applyPlayResult(r,{animate,prevFrames});
+  return r;
+}
+// 服务器应手（仅 AI 模式：机器人开局 / 人类落子后的机器人应手）
+async function postPlay(history,{animate}={}){
+  play.busy=true;updateUndoBtn();
+  const prevFrames=state.frames.length;
+  const payload={humanSide:play.humanSide,history,...(play.opp.type==='bot'?{botId:play.opp.botId}:{template:play.opp.name})};
+  const r=await apiFetch('POST','/api/play',payload);
+  if(!r.ok){play.busy=false;updateUndoBtn();toast(r.error||'走子失败');return null;}
+  applyPlayResult(r,{animate,prevFrames});
   return r;
 }
 async function startPlay(){
@@ -864,19 +919,21 @@ async function startPlay(){
   play.history=[];play.legal=[];play.sel=null;play.undosLeft=3;play.busy=false;play.resultShown=false;
   state.match=null;state.frames=[];state.cur=0;
   $('statusLine').textContent='对局开始…';
-  const r=await postPlay([]);
-  if(!r){play.started=false;updateUndoBtn();return;}
+  if(play.humanSide==='black'){
+    localApply([],{animate:false});      // 人类执黑先行：本地初始化，零延迟
+  }else{
+    const r=await postPlay([]);           // 人类执红：机器人（黑）先手，服务器走第一手
+    if(!r){play.started=false;updateUndoBtn();return;}
+  }
   toast(`对局开始：你执${play.humanSide==='black'?'梭子蟹（黑方 · 先手）':'龙虾（红方 · 后手）'}，对手「${play.opp.name}」`);
 }
-async function startLocalPlay(){
+function startLocalPlay(){
   play.mode='local';play.started=true;play.over=false;play.opp=null;
   play.p1=$('p1Name').value.trim()||'玩家 1';
   play.p2=$('p2Name').value.trim()||'玩家 2';
   play.history=[];play.legal=[];play.sel=null;play.busy=false;play.resultShown=false;
   state.match=null;state.frames=[];state.cur=0;
-  $('statusLine').textContent='对局开始…';
-  const r=await postPlay([]);
-  if(!r){play.started=false;updateUndoBtn();return;}
+  localApply([],{animate:false});        // 双人同屏：全程本地，无需服务器
   toast(`对局开始：${play.p1} 执梭子蟹（黑方）先行，${play.p2} 执龙虾（红方）`);
 }
 function onCellClick(x,y){
@@ -886,7 +943,7 @@ function onCellClick(x,y){
     const mv=play.legal.find((m)=>m.from[0]===play.sel[0]&&m.from[1]===play.sel[1]&&m.to[0]===x&&m.to[1]===y);
     if(mv){
       const newHistory=play.history.concat([{side:play.humanSide,from:mv.from,to:mv.to,pass:false}]);
-      postPlay(newHistory,{animate:true});
+      doHumanMove(newHistory);
       return;
     }
   }
@@ -896,7 +953,17 @@ function onCellClick(x,y){
     renderFrame();
   }
 }
-async function undoMove(){
+// 人类落子：双人同屏全程本地；AI 模式先本地即时落子（零延迟），再异步取机器人应手
+async function doHumanMove(newHistory){
+  if(play.mode==='local'){ localApply(newHistory,{animate:true}); return; }
+  const prevHistory=play.history;
+  const interim=localApply(newHistory,{animate:false}); // 人类这步立即落子渲染（不等网络）
+  if(interim.status.over) return;     // 人类落子即终局，无需服务器
+  if(!interim.needBot) return;        // 机器人被迫停手并已轮回人类，本地已完成
+  const r=await postPlay(newHistory,{animate:true}); // 取机器人应手并播放
+  if(!r) localApply(prevHistory,{animate:false});    // 应手失败 → 回滚到落子前，恢复人类可走
+}
+function undoMove(){
   if(play.undosLeft<=0||play.busy)return;
   let lastHuman=-1;
   for(let i=play.history.length-1;i>=0;i--){
@@ -905,11 +972,11 @@ async function undoMove(){
   if(lastHuman<0)return toast('还没有可悔的着法');
   play.undosLeft--;play.over=false;play.resultShown=false;closeModal('resultOverlay');
   const truncated=play.history.slice(0,lastHuman).map((h)=>({side:h.side,from:h.from,to:h.to,pass:h.pass}));
-  await postPlay(truncated);
+  localApply(truncated,{animate:false}); // 悔棋后轮到人类，纯本地回放即可（无需服务器）
   toast(`已悔棋（剩 ${play.undosLeft} 次）`);
 }
 // 双人同屏悔棋：撤销最后一步实际走子（不限次数，双方协商使用）
-async function undoLocal(){
+function undoLocal(){
   if(!play.started||play.busy)return;
   let last=-1;
   for(let i=play.history.length-1;i>=0;i--){
@@ -918,7 +985,7 @@ async function undoLocal(){
   if(last<0)return toast('还没有可悔的着法');
   play.over=false;play.resultShown=false;closeModal('resultOverlay');
   const truncated=play.history.slice(0,last).map((h)=>({side:h.side,from:h.from,to:h.to,pass:h.pass}));
-  await postPlay(truncated);
+  localApply(truncated,{animate:false});
   toast('已悔一手');
 }
 $('startPlayBtn').addEventListener('click',startPlay);
