@@ -132,13 +132,17 @@ function rateLimited(res, gate) {
 }
 // 公开访问 origin。生产经 Nginx 反代终止 TLS，到达 Node 的请求本身是明文，
 // 直接拼 http:// 会让发给 Agent 的链接是 http（部分 Agent 拒绝访问）。
-// 优先用 PUBLIC_ORIGIN 钉死（如 https://clawclash.cn）；否则取反代透传的
-// X-Forwarded-Proto；都没有时按连接是否加密回退。
+// 取协议的优先级：① PUBLIC_ORIGIN 钉死（如 https://clawclash.cn）→ ② 反代透传的
+// X-Forwarded-Proto → ③ 本机直连是否加密 → ④ 生产环境（非本机）默认 https。
+// ④ 兜底是为了反代未配置 X-Forwarded-Proto 的情况，免去改 Nginx / 注入 env。
 function originOf(req) {
   if (process.env.PUBLIC_ORIGIN) return process.env.PUBLIC_ORIGIN.replace(/\/+$/, '');
   const host = req.headers.host || 'localhost:' + PORT;
   const xfProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
-  const proto = xfProto || (req.socket && req.socket.encrypted ? 'https' : 'http');
+  const isLocal = /^(localhost|127\.|\[?::1\]?)/i.test(host);
+  const proto = xfProto
+    || ((req.socket && req.socket.encrypted) ? 'https' : '')
+    || ((IS_PROD && !isLocal) ? 'https' : 'http');
   return `${proto}://${host}`;
 }
 
