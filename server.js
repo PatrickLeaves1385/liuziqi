@@ -130,7 +130,17 @@ function rateLimited(res, gate) {
   sendJson(res, 429, { ok: false, error: `请求过于频繁，请 ${gate.retryAfterSec}s 后重试` }, { 'Retry-After': String(gate.retryAfterSec) });
   return true;
 }
-function originOf(req) { return `http://${req.headers.host || 'localhost:' + PORT}`; }
+// 公开访问 origin。生产经 Nginx 反代终止 TLS，到达 Node 的请求本身是明文，
+// 直接拼 http:// 会让发给 Agent 的链接是 http（部分 Agent 拒绝访问）。
+// 优先用 PUBLIC_ORIGIN 钉死（如 https://clawclash.cn）；否则取反代透传的
+// X-Forwarded-Proto；都没有时按连接是否加密回退。
+function originOf(req) {
+  if (process.env.PUBLIC_ORIGIN) return process.env.PUBLIC_ORIGIN.replace(/\/+$/, '');
+  const host = req.headers.host || 'localhost:' + PORT;
+  const xfProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const proto = xfProto || (req.socket && req.socket.encrypted ? 'https' : 'http');
+  return `${proto}://${host}`;
+}
 
 // 发送邮箱验证链接。生产须接入 SMTP（部署侧）；当前实现仅记录到日志，
 // 非生产环境额外把链接随响应返回，便于演示。返回 { verifyUrl, devExposed }。
@@ -502,7 +512,7 @@ route('GET', '/api/bot/me/prompt', (req, res) => {
   if (!bot) return sendJson(res, 404, { ok: false, error: '尚未创建棋手' });
   const keyInfo = db.getBotKeyInfo(bot.id);
   const key = keyInfo ? keyInfo.key_plain : '';
-  const origin = `http://${req.headers.host || 'localhost:' + PORT}`;
+  const origin = originOf(req);
   const prompt = [
     '你是我的钳王争霸 Agent。请为我的棋手编写并提交对弈脚本。',
     '',
