@@ -828,14 +828,36 @@ route('POST', '/api/agent/challenge', async (req, res, _m, body) => {
 // § 天梯排行榜
 // GET /api/leaderboard
 // ============================================================
-route('GET', '/api/leaderboard', (req, res) => {
+// 微缓存（P0）：榜单仅在对局结束后变化，可容忍数秒陈旧。缓存「序列化后的 JSON + ETag」，
+// TTL 内复用：① 省去 DB 查询/序列化；② 配合 Cache-Control 让浏览器/反代短缓存或走 304，
+// 使「刷新天梯榜」在后端偶发卡顿（建连/事件循环阻塞）时仍能由缓存即时响应，不必每次回源 Node。
+const LEADERBOARD_TTL_MS = 15000;
+let lbCache = null; // { body, etag, expires }
+function leaderboardPayload() {
+  const now = Date.now();
+  if (lbCache && lbCache.expires > now) return lbCache;
   const bots = db.listBots();
-  sendJson(res, 200, { ok: true, leaderboard: bots.map((b, i) => ({
+  const body = JSON.stringify({ ok: true, leaderboard: bots.map((b, i) => ({
     rank: i + 1, botId: b.id, name: b.name, avatar: b.avatar,
     nickname: b.nickname, rp: b.rp, rankName: rankLabel(b.rp),
     wins: b.wins, losses: b.losses, draws: b.draws,
     currentVersion: b.current_version,
   })) });
+  const etag = '"' + crypto.createHash('sha1').update(body).digest('base64') + '"';
+  lbCache = { body, etag, expires: now + LEADERBOARD_TTL_MS };
+  return lbCache;
+}
+route('GET', '/api/leaderboard', (req, res) => {
+  const { body, etag } = leaderboardPayload();
+  const headers = {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Cache-Control': 'public, max-age=15, stale-while-revalidate=60',
+    ETag: etag,
+  };
+  if (req.headers['if-none-match'] === etag) { res.writeHead(304, headers); return res.end(); }
+  res.writeHead(200, headers);
+  res.end(body);
 });
 
 // ============================================================
