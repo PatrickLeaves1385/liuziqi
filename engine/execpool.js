@@ -1,7 +1,7 @@
 'use strict';
 // 父进程侧：把不可信对局/烟雾/试玩 fork 到独立子进程执行（fork-per-task），
-// 不阻塞主事件循环；超时硬杀子进程。配合 env 剥离机密，收敛 RCE 影响面。
-// 注意：这不是完整 RCE 防护（子进程仍可读 FS）——生产须叠加 OS 级隔离，见 SECURITY.md。
+// 不阻塞主事件循环；超时硬杀子进程。配合 env 剥离机密 + Node 权限模型收敛 RCE 影响面。
+// 注意：仍非完整 RCE 防护（权限模型不拦网络出站）——生产须叠加 OS 级隔离，见 SECURITY.md。
 const { fork } = require('child_process');
 const path = require('path');
 
@@ -10,6 +10,17 @@ const MAX_CONCURRENT = 8;   // 全局同时在跑的子进程上限，超出回 
 const MAX_PER_OWNER = 2;    // 单账号/IP 同时在跑上限，防单个来源占满全局池
 let inFlight = 0;
 const perOwner = new Map(); // ownerKey -> 在跑数
+
+// Node 权限模型（Node ≥22 稳定）：给不可信子进程加一道进程内闸门，作为 OS 级隔离之下的纵深防御。
+// 即便 vm 逃逸拿到真实的 fs / child_process，越权操作也会在 C++ 层被拒（ERR_ACCESS_DENIED）：
+//   --permission              开启权限模型 → 默认拒绝 fs 写、child_process、worker、原生插件
+//   --allow-fs-read=<engine>  只放行读取 engine/ 目录（跑对局所需的本仓库代码，非机密）。
+//     app 根目录下的 ecosystem.config.js（含 SESSION_SECRET）与 sixchess.db 都在 engine/ 之外
+//     → 逃逸后也读不到；不放行任何 fs 写、不放行 child_process/worker。
+// 网络出站权限模型「不」拦截，仍须靠部署侧防火墙禁止子进程对外连接（见 SECURITY.md）。
+// 兜底开关：极端不兼容时设 CHILD_PERMISSION=off 可关闭本闸门回退，无需改代码。
+const CHILD_PERMISSION = process.env.CHILD_PERMISSION !== 'off';
+const PERMISSION_ARGS = ['--permission', `--allow-fs-read=${__dirname}`];
 
 // 子进程 env 白名单：仅保留 OS/Node 运行必需项，剥离 SESSION_SECRET、SMTP 等机密
 const ENV_WHITELIST = ['PATH', 'SystemRoot', 'windir', 'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL', 'NODE_OPTIONS'];
@@ -27,7 +38,9 @@ function runTask(task, hardMs, ownerKey) {
   inFlight++;
   if (ownerKey) perOwner.set(ownerKey, ownerCount + 1);
   return new Promise((resolve, reject) => {
-    const child = fork(RUNNER, [], { env: childEnv(), stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
+    const forkOpts = { env: childEnv(), stdio: ['ignore', 'ignore', 'inherit', 'ipc'] };
+    if (CHILD_PERMISSION) forkOpts.execArgv = PERMISSION_ARGS; // 关闭时继承父进程默认，不加权限闸门
+    const child = fork(RUNNER, [], forkOpts);
     let settled = false;
     const done = (fn, v) => {
       if (settled) return;

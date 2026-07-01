@@ -8,6 +8,11 @@
   - 子进程 env 经白名单剥离机密（`SESSION_SECRET`、SMTP 等不传入），逃逸后读不到这些机密；
   - 父进程对每个任务设硬超时并 `SIGKILL` 子进程，**主事件循环不被阻塞**（实测：子进程跑死循环烟雾时，主进程其它请求仍毫秒级响应）；
   - 子进程不持有数据库句柄；并发子进程数有上限（超出回 503）。
+- **Node 权限模型（子进程内进程级闸门）**：`execpool.js` 以 `--permission --allow-fs-read=<engine 目录>` fork 子进程。即便 vm 逃逸拿到宿主 realm 的真实 `fs`/`child_process`，越权操作也会在 C++ 层被拒（`ERR_ACCESS_DENIED`）：
+  - **只放行读取 `engine/` 目录**（跑对局所需的本仓库代码，非机密）。app 根目录下的 `ecosystem.config.js`（含 `SESSION_SECRET`）与 `sixchess.db` 都在 `engine/` 之外 → **逃逸后也读不到**（已实测：关闭权限模型时逃逸脚本能读出密钥文件，开启后同样脚本被 `ERR_ACCESS_DENIED` 拦下）；
+  - **禁止一切 fs 写、`child_process`、`worker_threads`、原生插件**（均实测 `ERR_ACCESS_DENIED`）；
+  - 兜底开关 `CHILD_PERMISSION=off` 可临时关闭（仅在极端不兼容时用，不建议线上关）；
+  - **权限模型不拦网络出站**——网络隔离仍须靠部署侧（见下方第 3 项）。
 - **每手挂钟超时**：`engine/sandbox.js` 通过 vm `timeout` 对每次 `onTurn` 强制超时（`MOVE_TIMEOUT_MS`，数秒级），中断死循环/长耗时 → 判 `runtime` 负。
 - **单场挂钟上限**：`engine/engine_quota.js` 的 `playMatch(maxMatchMs)` 防"每手不超时但整体长拖"的慢速消耗。
 - **思考点计量（每手实例化）**：`makeRules(budget)` 每手一个计量实例，并发对局互不串改；交给脚本的 `Rules` 只含安全 API（**移除了 `_reset` / `_rawApply`**，杜绝脚本自行重置预算或绕过计量）。
@@ -18,13 +23,12 @@
 
 ## 二、部署侧必须补齐（否则不要上公网）
 
-> **Node 的 `vm` 不是安全边界。** 子进程内仍可经宿主对象（`game.rules`、`game.board` 等）的原型链触达该子进程的宿主 realm，进而 `require('fs')` 读盘。代码层已把执行关进**独立子进程**（机密不在其 env、句柄不可达、可被杀），但子进程本身仍需 OS 级隔离才能真正"关进盒子"：
+> **Node 的 `vm` 不是安全边界。** 子进程内仍可经宿主对象（`game.rules`、`game.board`、`me.pieces` 等）的原型链触达该子进程的宿主 realm。代码层已把执行关进**独立子进程**并叠加 **Node 权限模型**——逃逸后已读不到机密文件/数据库、不能写盘、不能起子进程/线程（见上）。**但权限模型不拦网络出站**，且深度防御仍建议再叠一层 OS 级隔离。下列按「当前风险」排序，**第 1 项（网络）为上公网前的必做**：
 
-1. **进程/容器隔离**：让 `engine/runner.js` 子进程跑在独立的低权限用户/容器中（容器 + seccomp，或 gVisor/Firecracker 等）。代码已是 fork-per-task 的可杀子进程，部署侧补齐 OS 约束即可。
-2. **文件系统**：对执行子进程只读挂载，且**令其无法读取** `sixchess.db` 与任何密钥文件（escape 后可 `require('fs')` 读盘）。
-3. **网络**：禁止执行进程对外发起网络连接（防数据外带/打内网）。
-4. **密钥隔离**：`SESSION_SECRET` 等机密**不要**出现在执行进程可读的环境变量里（escape 后可读 `process.env`）。
-5. **资源上限**：对执行进程设 CPU/内存/句柄 cgroup 限额，叠加在挂钟超时之上。
+1. **网络出站隔离（必做）**：权限模型不拦 socket，逃逸脚本仍可对外连接（数据外带 / 打内网 / SSRF）。让 `engine/runner.js` 子进程无法主动对外发起连接——推荐做法：将 runner 子进程以**专用低权限用户**运行，再用 `iptables`/`nftables` 的 owner 匹配丢弃该用户的 OUTPUT（放行到主进程 IPC 所需的本机回环即可）；或整体置于禁网的网络命名空间/容器。
+2. **进程/容器隔离（建议）**：让子进程跑在独立低权限用户 / 容器中（容器 + seccomp，或 gVisor/Firecracker 等），把权限模型之外的攻击面（内核漏洞、`/proc` 信息泄露等）也收口。代码已是 fork-per-task 的可杀子进程，部署侧补齐 OS 约束即可。
+3. **资源上限（建议）**：对执行进程设 CPU/内存/句柄 cgroup 限额，叠加在挂钟超时之上，防单场极端占用拖垮小机器。
+4. **密钥隔离（已由权限模型 + env 白名单覆盖，仍建议冗余）**：`SESSION_SECRET` 等机密既不在子进程 env 中，其所在文件也在只读放行目录之外；进一步可把机密文件挪出应用目录并收紧属主权限。
 
 ## 三、其他部署项
 
