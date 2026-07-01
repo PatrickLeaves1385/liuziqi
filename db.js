@@ -274,6 +274,7 @@ const stmtGetAccountByEmail = db.prepare('SELECT * FROM accounts WHERE email=?')
 const stmtGetAccountByNickname = db.prepare('SELECT * FROM accounts WHERE nickname=?');
 const stmtGetAccountById = db.prepare('SELECT * FROM accounts WHERE id=?');
 const stmtSetEmailVerified = db.prepare('UPDATE accounts SET email_verified=1 WHERE id=?');
+const stmtVerifyAllAccounts = db.prepare('UPDATE accounts SET email_verified=1 WHERE email_verified=0');
 
 // ---- 棋手 ----
 const stmtInsertBot = db.prepare('INSERT INTO bots(account_id,name,avatar,created_at) VALUES(?,?,?,?)');
@@ -460,6 +461,8 @@ module.exports = {
   getAccountByNickname: (nickname) => stmtGetAccountByNickname.get(nickname),
   getAccountById: (id) => stmtGetAccountById.get(id),
   setEmailVerified: (accountId) => stmtSetEmailVerified.run(accountId),
+  // 一次性把所有未验证账号置为已验证（邮箱验证关闭时用）；返回受影响行数。
+  markAllAccountsVerified: () => stmtVerifyAllAccounts.run().changes,
 
   // 棋手
   createBot(accountId, name, avatar) {

@@ -18,12 +18,21 @@ const rl = require('./ratelimit');
 
 const PORT = process.env.PORT || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
+// 邮箱验证开关：未接入 SMTP 期间默认「关闭」→ 新注册账号直接视为已验证，且启动时把历史未验证账号
+// 一次性置为已验证（免正式挑战被 403 拦、免前端「未验证」横幅）。接入 SMTP 后设环境变量
+// EMAIL_VERIFICATION=on 即恢复真实验证流程（届时新注册需完成邮箱验证才能发起正式挑战）。
+const EMAIL_VERIFICATION = process.env.EMAIL_VERIFICATION === 'on';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const AVATAR_DIR = path.join(PUBLIC_DIR, 'avatars');
 const MAX_AVATAR_BYTES = 100 * 1024; // 100KB
 const MIN_PASSWORD_LEN = 8;
 const MAX_PASSWORD_LEN = 256; // 上限防超长密码拖慢 scrypt
 fs.mkdirSync(AVATAR_DIR, { recursive: true });
+// 验证关闭时：把库里遗留的未验证账号一次性补齐为已验证（幂等，仅影响 email_verified=0 的行）。
+if (!EMAIL_VERIFICATION) {
+  const n = db.markAllAccountsVerified();
+  if (n) console.log(`[邮箱验证已关闭] 已将 ${n} 个历史未验证账号置为已验证`);
+}
 
 const TEMPLATE_META = [
   { name: '子力派', summary: '以子力差为主，辅以机动与中心；直接吃子换子。', kind: 'template' },
@@ -347,12 +356,19 @@ route('POST', '/api/account/register', (req, res, _m, body) => {
   if (db.getAccountByEmail(email))
     return sendJson(res, 409, { ok: false, field: 'email', error: '该邮箱已注册' });
   const account = db.createAccount(nickname, email, auth.hashPassword(password));
-  const mail = sendVerificationEmail(req, account);
+  let verifyUrl;
+  if (EMAIL_VERIFICATION) {
+    const mail = sendVerificationEmail(req, account);
+    // 仅非生产环境回传验证链接，便于演示（生产由邮件投递）
+    verifyUrl = mail.devExposed ? mail.verifyUrl : undefined;
+  } else {
+    // 验证关闭：直接置为已验证，跳过邮箱验证流程
+    db.setEmailVerified(account.id);
+  }
   sendJson(res, 201, {
     ok: true, accountId: account.id, nickname: account.nickname,
-    emailVerified: false,
-    // 仅非生产环境回传验证链接，便于演示（生产由邮件投递）
-    verifyUrl: mail.devExposed ? mail.verifyUrl : undefined,
+    emailVerified: !EMAIL_VERIFICATION,
+    verifyUrl,
   }, { 'Set-Cookie': auth.sessionCookie(account.id) });
 });
 
