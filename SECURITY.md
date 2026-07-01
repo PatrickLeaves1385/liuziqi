@@ -25,7 +25,16 @@
 
 > **Node 的 `vm` 不是安全边界。** 子进程内仍可经宿主对象（`game.rules`、`game.board`、`me.pieces` 等）的原型链触达该子进程的宿主 realm。代码层已把执行关进**独立子进程**并叠加 **Node 权限模型**——逃逸后已读不到机密文件/数据库、不能写盘、不能起子进程/线程（见上）。**但权限模型不拦网络出站**，且深度防御仍建议再叠一层 OS 级隔离。下列按「当前风险」排序，**第 1 项（网络）为上公网前的必做**：
 
-1. **网络出站隔离（必做）**：权限模型不拦 socket，逃逸脚本仍可对外连接（数据外带 / 打内网 / SSRF）。让 `engine/runner.js` 子进程无法主动对外发起连接——推荐做法：将 runner 子进程以**专用低权限用户**运行，再用 `iptables`/`nftables` 的 owner 匹配丢弃该用户的 OUTPUT（放行到主进程 IPC 所需的本机回环即可）；或整体置于禁网的网络命名空间/容器。
+1. **网络出站隔离（必做）**：权限模型不拦 socket，逃逸脚本仍可对外连接（数据外带 / 打内网 / SSRF）。做法——让 runner 子进程以**专用低权限用户**运行，再用 `iptables`/`nftables` 的 owner 匹配丢弃该用户的 OUTPUT（放行本机回环即可）。**降权已由代码支持**：`execpool.js` 读环境变量 `RUNNER_UID`/`RUNNER_GID`（POSIX，Windows 自动跳过）以该用户 fork 子进程；主进程须有 setuid 权限（PM2 以 root 跑即可），且该用户须能读 `engine/` 与 node 可执行文件。配置示例：
+
+   ```bash
+   useradd -r -s /usr/sbin/nologin clawbot           # 建专用无登录用户
+   id -u clawbot; id -g clawbot                       # 取数字 uid/gid，填入 ecosystem.config.js 的 env
+   #   env: { ..., RUNNER_UID: '<uid>', RUNNER_GID: '<gid>' }
+   iptables -A OUTPUT -m owner --uid-owner clawbot -o lo -j ACCEPT   # 放行回环（IPC/本地）
+   iptables -A OUTPUT -m owner --uid-owner clawbot -j REJECT         # 丢弃其余对外连接
+   ```
+   或整体置于禁网的网络命名空间 / 容器。
 2. **进程/容器隔离（建议）**：让子进程跑在独立低权限用户 / 容器中（容器 + seccomp，或 gVisor/Firecracker 等），把权限模型之外的攻击面（内核漏洞、`/proc` 信息泄露等）也收口。代码已是 fork-per-task 的可杀子进程，部署侧补齐 OS 约束即可。
 3. **资源上限（建议）**：对执行进程设 CPU/内存/句柄 cgroup 限额，叠加在挂钟超时之上，防单场极端占用拖垮小机器。
 4. **密钥隔离（已由权限模型 + env 白名单覆盖，仍建议冗余）**：`SESSION_SECRET` 等机密既不在子进程 env 中，其所在文件也在只读放行目录之外；进一步可把机密文件挪出应用目录并收紧属主权限。

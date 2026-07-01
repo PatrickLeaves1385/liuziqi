@@ -22,6 +22,15 @@ const perOwner = new Map(); // ownerKey -> 在跑数
 const CHILD_PERMISSION = process.env.CHILD_PERMISSION !== 'off';
 const PERMISSION_ARGS = ['--permission', `--allow-fs-read=${__dirname}`];
 
+// 可选：以专用低权限用户运行 runner 子进程（仅 POSIX）。设 RUNNER_UID（必要时 RUNNER_GID）为目标
+// 用户的数字 id（`id -u clawbot` / `id -g clawbot`）。这样即可用 iptables owner 匹配禁掉「该用户」的
+// 网络出站——权限模型不拦网络，须靠这层堵住逃逸后的数据外带/打内网（见 SECURITY.md）。
+// 前置条件：主进程有权 setuid（生产 PM2 以 root 跑）；目标用户须能读 engine/ 与 node 可执行文件。
+// Windows 不支持 setuid → 自动跳过，不影响本地开发。
+const posix = process.platform !== 'win32';
+const RUNNER_UID = posix && Number.isInteger(+process.env.RUNNER_UID) && process.env.RUNNER_UID !== '' ? +process.env.RUNNER_UID : undefined;
+const RUNNER_GID = posix && Number.isInteger(+process.env.RUNNER_GID) && process.env.RUNNER_GID !== '' ? +process.env.RUNNER_GID : undefined;
+
 // 子进程 env 白名单：仅保留 OS/Node 运行必需项，剥离 SESSION_SECRET、SMTP 等机密
 const ENV_WHITELIST = ['PATH', 'SystemRoot', 'windir', 'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL', 'NODE_OPTIONS'];
 function childEnv() {
@@ -40,6 +49,8 @@ function runTask(task, hardMs, ownerKey) {
   return new Promise((resolve, reject) => {
     const forkOpts = { env: childEnv(), stdio: ['ignore', 'ignore', 'inherit', 'ipc'] };
     if (CHILD_PERMISSION) forkOpts.execArgv = PERMISSION_ARGS; // 关闭时继承父进程默认，不加权限闸门
+    if (RUNNER_UID !== undefined) forkOpts.uid = RUNNER_UID;   // POSIX 且已配置时降权到专用用户
+    if (RUNNER_GID !== undefined) forkOpts.gid = RUNNER_GID;
     const child = fork(RUNNER, [], forkOpts);
     let settled = false;
     const done = (fn, v) => {
