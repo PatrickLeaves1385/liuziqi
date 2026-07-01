@@ -60,4 +60,11 @@ module.exports = {
   runChallenge: (chCode, cdCode, seed, budget, ownerKey) => runTask({ type: 'challenge', chCode, cdCode, seed, budget }, 40000, ownerKey),
   // 试玩：单请求推进若干手
   runPlay: (spec, ownerKey) => runTask({ type: 'play', spec }, 20000, ownerKey),
+
+  // 囚徒困境：烟雾 6 场（每场 ≤1100 回合 × 50ms = 55s，总硬超时给足余量）
+  runPrisonerSmoke: (code, ownerKey) => runTask({ type: 'prisoner-smoke', code }, 90000, ownerKey),
+  // 囚徒困境：单场正式挑战
+  runPrisonerChallenge: (aCode, bCode, seed, ownerKey) => runTask({ type: 'prisoner-challenge', aCode, bCode, seed }, 30000, ownerKey),
+  // 囚徒困境：试玩单回合推进（玩家囚徒走子进程，主进程不载入用户脚本）
+  runPrisonerPlayOne: (args, ownerKey) => runTask({ type: 'prisoner-play-one', ...args }, 5000, ownerKey),
 };

@@ -109,6 +109,90 @@ CREATE INDEX IF NOT EXISTS idx_matches_challenged ON matches(challenged_bot_id);
 CREATE INDEX IF NOT EXISTS idx_code_bot ON code_versions(bot_id);
 CREATE INDEX IF NOT EXISTS idx_battles_challenger ON battles(challenger_bot_id);
 CREATE INDEX IF NOT EXISTS idx_battles_challenged ON battles(challenged_bot_id);
+
+-- ============================================================
+-- 囚徒困境（与钳王争霸完全独立的表族；通过 accounts.id 在用户层串联）
+-- ============================================================
+CREATE TABLE IF NOT EXISTS prisoner_bots (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id      INTEGER UNIQUE NOT NULL,
+  name            TEXT    NOT NULL,
+  avatar          TEXT    NOT NULL DEFAULT 'preset:1',
+  current_version INTEGER NOT NULL DEFAULT 0,
+  rp              INTEGER NOT NULL DEFAULT 0,
+  wins   INTEGER NOT NULL DEFAULT 0,
+  losses INTEGER NOT NULL DEFAULT 0,
+  draws  INTEGER NOT NULL DEFAULT 0,
+  created_at      INTEGER NOT NULL,
+  FOREIGN KEY (account_id) REFERENCES accounts(id)
+);
+
+CREATE TABLE IF NOT EXISTS prisoner_api_keys (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  prisoner_id INTEGER NOT NULL,
+  key_hash   TEXT    NOT NULL,
+  key_prefix TEXT    NOT NULL,
+  key_plain  TEXT    NOT NULL,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (prisoner_id) REFERENCES prisoner_bots(id)
+);
+
+CREATE TABLE IF NOT EXISTS prisoner_code_versions (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  prisoner_id  INTEGER NOT NULL,
+  version      INTEGER NOT NULL,
+  code         TEXT    NOT NULL,
+  code_hash    TEXT    NOT NULL,
+  notes        TEXT,
+  submitted_by TEXT,
+  smoke_status TEXT    NOT NULL DEFAULT 'pending',
+  smoke_detail TEXT,
+  created_at   INTEGER NOT NULL,
+  UNIQUE(prisoner_id, version),
+  FOREIGN KEY (prisoner_id) REFERENCES prisoner_bots(id)
+);
+
+-- 囚徒对局：单场 N∈[900,1100]，无双局制。
+-- result: 'challenger'(挑战者胜) | 'challenged'(被挑战者胜) | 'draw'
+-- move_blob: 紧凑选择序列（每回合 2 bit：a-bit + b-bit；按位打包）
+CREATE TABLE IF NOT EXISTS prisoner_battles (
+  id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+  match_url_id             TEXT    UNIQUE NOT NULL,
+  challenger_prisoner_id   INTEGER NOT NULL,
+  challenged_prisoner_id   INTEGER NOT NULL,
+  ch_code_version          INTEGER NOT NULL,
+  cd_code_version          INTEGER NOT NULL,
+  ch_code_hash             TEXT    NOT NULL,
+  cd_code_hash             TEXT    NOT NULL,
+  result                   TEXT    NOT NULL,
+  reason                   TEXT    NOT NULL,  -- completed | illegal | runtime | error
+  actual_rounds            INTEGER NOT NULL,  -- 引擎抽样的总回合数（即便提前判负也保留抽样值）
+  ch_score                 INTEGER NOT NULL,
+  cd_score                 INTEGER NOT NULL,
+  ch_rp_delta              INTEGER,
+  cd_rp_delta              INTEGER,
+  scored                   INTEGER NOT NULL DEFAULT 1,
+  seed                     INTEGER NOT NULL,
+  move_blob                BLOB    NOT NULL,  -- 紧凑选择序列
+  failure_detail           TEXT,              -- 非 completed 时的明细 JSON
+  played_at                INTEGER NOT NULL,
+  FOREIGN KEY (challenger_prisoner_id) REFERENCES prisoner_bots(id),
+  FOREIGN KEY (challenged_prisoner_id) REFERENCES prisoner_bots(id)
+);
+
+CREATE TABLE IF NOT EXISTS prisoner_hash_pair_scores (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  prisoner_id INTEGER NOT NULL,
+  my_hash     TEXT    NOT NULL,
+  opp_hash    TEXT    NOT NULL,
+  used_count  INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(prisoner_id, my_hash, opp_hash),
+  FOREIGN KEY (prisoner_id) REFERENCES prisoner_bots(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_prisoner_battles_ch ON prisoner_battles(challenger_prisoner_id);
+CREATE INDEX IF NOT EXISTS idx_prisoner_battles_cd ON prisoner_battles(challenged_prisoner_id);
+CREATE INDEX IF NOT EXISTS idx_prisoner_code_prisoner ON prisoner_code_versions(prisoner_id);
 `);
 
 // ---- 增量迁移：matches 关联到场（battle）----
@@ -283,6 +367,84 @@ function eloUpdate(rA, rB, scoreA, K = 32) {
   return Math.round(rA + K * (scoreA - exp));
 }
 
+// ============================================================
+// 囚徒困境表的 prepared statements
+// ============================================================
+const stmtInsertPrisoner = db.prepare('INSERT INTO prisoner_bots(account_id,name,avatar,created_at) VALUES(?,?,?,?)');
+const stmtGetPrisonerById = db.prepare('SELECT * FROM prisoner_bots WHERE id=?');
+const stmtGetPrisonerByName = db.prepare('SELECT * FROM prisoner_bots WHERE name=?');
+const stmtGetPrisonerByAccount = db.prepare('SELECT * FROM prisoner_bots WHERE account_id=?');
+const stmtUpdatePrisonerVersion = db.prepare('UPDATE prisoner_bots SET current_version=? WHERE id=?');
+const stmtUpdatePrisonerAvatar = db.prepare('UPDATE prisoner_bots SET avatar=? WHERE id=?');
+const stmtUpdatePrisonerStats = db.prepare('UPDATE prisoner_bots SET rp=?,wins=wins+?,losses=losses+?,draws=draws+? WHERE id=?');
+const stmtListPrisoners = db.prepare('SELECT p.*,a.nickname FROM prisoner_bots p JOIN accounts a ON p.account_id=a.id ORDER BY p.rp DESC, p.id ASC LIMIT 100');
+const stmtPrisonerRankPos = db.prepare(`
+  SELECT COUNT(*)+1 AS pos FROM prisoner_bots p, (SELECT rp FROM prisoner_bots WHERE id=?) me
+  WHERE p.rp > me.rp OR (p.rp = me.rp AND p.id < ?)`);
+
+const stmtInsertPrisonerKey = db.prepare('INSERT INTO prisoner_api_keys(prisoner_id,key_hash,key_prefix,key_plain,created_at) VALUES(?,?,?,?,?)');
+const stmtDeletePrisonerKeys = db.prepare('DELETE FROM prisoner_api_keys WHERE prisoner_id=?');
+const stmtGetPrisonerKey = db.prepare('SELECT key_plain,key_prefix FROM prisoner_api_keys WHERE prisoner_id=? ORDER BY id DESC LIMIT 1');
+const stmtGetPrisonerByKey = db.prepare(`
+  SELECT p.* FROM prisoner_bots p
+  JOIN prisoner_api_keys k ON k.prisoner_id=p.id
+  WHERE k.key_hash=? LIMIT 1`);
+
+const stmtInsertPrisonerVersion = db.prepare(`
+  INSERT INTO prisoner_code_versions(prisoner_id,version,code,code_hash,notes,submitted_by,smoke_status,smoke_detail,created_at)
+  VALUES(?,?,?,?,?,?,?,?,?)`);
+const stmtGetPrisonerVersion = db.prepare('SELECT * FROM prisoner_code_versions WHERE prisoner_id=? AND version=?');
+const stmtListPrisonerVersions = db.prepare('SELECT id,prisoner_id,version,code_hash,notes,submitted_by,smoke_status,created_at FROM prisoner_code_versions WHERE prisoner_id=? ORDER BY version DESC LIMIT 50');
+const stmtGetPrisonerLatest = db.prepare("SELECT * FROM prisoner_code_versions WHERE prisoner_id=? AND smoke_status='passed' ORDER BY version DESC LIMIT 1");
+const stmtDeletePrisonerStaleVersions = db.prepare("DELETE FROM prisoner_code_versions WHERE prisoner_id=? AND version>=? AND smoke_status<>'passed'");
+
+const stmtInsertPrisonerBattle = db.prepare(`
+  INSERT INTO prisoner_battles(match_url_id,challenger_prisoner_id,challenged_prisoner_id,
+    ch_code_version,cd_code_version,ch_code_hash,cd_code_hash,
+    result,reason,actual_rounds,ch_score,cd_score,ch_rp_delta,cd_rp_delta,scored,seed,move_blob,failure_detail,played_at)
+  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+const stmtGetPrisonerBattle = db.prepare('SELECT * FROM prisoner_battles WHERE match_url_id=?');
+const stmtListPrisonerBattles = db.prepare(`
+  SELECT bt.*, cb.name AS challenger_name, db2.name AS challenged_name,
+    cb.avatar AS challenger_avatar, db2.avatar AS challenged_avatar
+  FROM prisoner_battles bt
+  JOIN prisoner_bots cb ON bt.challenger_prisoner_id=cb.id
+  JOIN prisoner_bots db2 ON bt.challenged_prisoner_id=db2.id
+  WHERE bt.challenger_prisoner_id=? OR bt.challenged_prisoner_id=?
+  ORDER BY bt.played_at DESC LIMIT ?`);
+
+const stmtUpsertPrisonerHash = db.prepare(`
+  INSERT INTO prisoner_hash_pair_scores(prisoner_id,my_hash,opp_hash,used_count) VALUES(?,?,?,1)
+  ON CONFLICT(prisoner_id,my_hash,opp_hash) DO UPDATE SET used_count=used_count+1`);
+const stmtGetPrisonerHash = db.prepare('SELECT * FROM prisoner_hash_pair_scores WHERE prisoner_id=? AND my_hash=? AND opp_hash=?');
+
+// move_blob 编解码：每回合 2 bit（高位 a 的选择，低位 b 的选择；C=0、D=1）
+function encodeMoves(history) {
+  const N = history.length;
+  const bytes = new Uint8Array(Math.ceil(N / 4));
+  for (let i = 0; i < N; i++) {
+    const a = history[i].a === 'D' ? 1 : 0;
+    const b = history[i].b === 'D' ? 1 : 0;
+    const code = (a << 1) | b; // 0..3
+    const byteIdx = i >> 2;
+    const shift = (3 - (i & 3)) * 2; // 高 -> 低
+    bytes[byteIdx] |= (code & 0x3) << shift;
+  }
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+}
+function decodeMoves(buf, totalRounds) {
+  const N = totalRounds;
+  const out = new Array(N);
+  const u = buf instanceof Uint8Array ? buf : Buffer.from(buf);
+  for (let i = 0; i < N; i++) {
+    const byteIdx = i >> 2;
+    const shift = (3 - (i & 3)) * 2;
+    const code = (u[byteIdx] >> shift) & 0x3;
+    out[i] = { a: (code & 0x2) ? 'D' : 'C', b: (code & 0x1) ? 'D' : 'C' };
+  }
+  return out;
+}
+
 // ---- 公开 API ----
 module.exports = {
   hashKey, codeHash, generateKey, urlId, now,
@@ -376,6 +538,74 @@ module.exports = {
   recomputeBotStats,
   getBotRankPosition(botId) { const r = stmtBotRankPos.get(botId); return r ? r.pos : null; },
   eloUpdate,
+
+  // ============================================================
+  // 囚徒困境
+  // ============================================================
+  createPrisoner(accountId, name, avatar) {
+    stmtInsertPrisoner.run(accountId, name, avatar || 'preset:1', now());
+    return stmtGetPrisonerByAccount.get(accountId);
+  },
+  getPrisonerById: (id) => stmtGetPrisonerById.get(id),
+  getPrisonerByName: (name) => stmtGetPrisonerByName.get(name),
+  getPrisonerByAccount: (accountId) => stmtGetPrisonerByAccount.get(accountId),
+  updatePrisonerAvatar: (id, avatar) => stmtUpdatePrisonerAvatar.run(avatar, id),
+  listPrisoners: () => stmtListPrisoners.all(),
+  getPrisonerRankPosition(id) { const r = stmtPrisonerRankPos.get(id, id); return r ? r.pos : null; },
+
+  createPrisonerApiKey(prisonerId) {
+    const key = generateKey();
+    stmtInsertPrisonerKey.run(prisonerId, hashKey(key), key.slice(0, 8), key, now());
+    return key;
+  },
+  rotatePrisonerApiKey(prisonerId) {
+    stmtDeletePrisonerKeys.run(prisonerId);
+    return this.createPrisonerApiKey(prisonerId);
+  },
+  getPrisonerKeyInfo: (prisonerId) => stmtGetPrisonerKey.get(prisonerId),
+  getPrisonerByApiKey: (key) => stmtGetPrisonerByKey.get(hashKey(key)),
+
+  publishPrisonerCodeVersion(prisonerId, version, code, notes, submittedBy) {
+    const hash = codeHash(code);
+    db.exec('BEGIN');
+    try {
+      stmtDeletePrisonerStaleVersions.run(prisonerId, version);
+      stmtInsertPrisonerVersion.run(prisonerId, version, code, hash, notes || null, submittedBy || null, 'passed', null, now());
+      stmtUpdatePrisonerVersion.run(version, prisonerId);
+      db.exec('COMMIT');
+    } catch (e) { db.exec('ROLLBACK'); throw e; }
+    return stmtGetPrisonerVersion.get(prisonerId, version);
+  },
+  getPrisonerVersion: (prisonerId, v) => stmtGetPrisonerVersion.get(prisonerId, v),
+  listPrisonerVersions: (prisonerId) => stmtListPrisonerVersions.all(prisonerId),
+  getLatestPassedPrisonerVersion(prisonerId) { return stmtGetPrisonerLatest.get(prisonerId); },
+
+  savePrisonerBattle(args) {
+    const blob = encodeMoves(args.history || []);
+    stmtInsertPrisonerBattle.run(
+      args.matchUrlId, args.challengerId, args.challengedId,
+      args.chVer, args.cdVer, args.chHash, args.cdHash,
+      args.result, args.reason, args.actualRounds, args.chScore, args.cdScore,
+      args.chRpDelta, args.cdRpDelta, args.scored ? 1 : 0, args.seed, blob,
+      args.failureDetail ? JSON.stringify(args.failureDetail) : null, now(),
+    );
+    return stmtGetPrisonerBattle.get(args.matchUrlId);
+  },
+  getPrisonerBattle(urlId) {
+    const row = stmtGetPrisonerBattle.get(urlId);
+    if (!row) return null;
+    // 解码 move_blob：以 history.length 为准（reason!=completed 时回放至中止处）
+    // 我们用 actual_rounds 作为编码长度；若失败提前结束，history 实际 < actual_rounds，
+    // 但编码时已按真实 history.length 编码 → 这里用 failure_detail.round 判定实际有效条数。
+    // 简化：始终按 actual_rounds 解码，无效末尾在前端按 reason 处理（P0 满意）。
+    return row;
+  },
+  decodePrisonerMoves: decodeMoves,
+  listPrisonerBattles(id, limit = 20) { return stmtListPrisonerBattles.all(id, id, limit); },
+
+  recordPrisonerHash(id, my, opp) { stmtUpsertPrisonerHash.run(id, my, opp); },
+  getPrisonerHash: (id, my, opp) => stmtGetPrisonerHash.get(id, my, opp),
+  updatePrisonerStats(id, newRp, w, l, d) { stmtUpdatePrisonerStats.run(newRp, w, l, d, id); },
 
   db, // 供直接查询
 };

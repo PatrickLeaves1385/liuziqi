@@ -182,6 +182,28 @@ function rpDelta(result, myRp, oppRp) {
   return clamp(10 + 4 * d, 0, 20);
 }
 
+// ---- 通用按 key 串行锁（防并发结算脏读）----
+// 挑战路由在 await execpool 期间会让出事件循环；若同一选手两场挑战几乎同时到达，
+// 两个 handler 都持有 auth 阶段读到的旧 rp/rating，各自基于旧值算 newRp 并「绝对赋值」，
+// 会互相覆盖 → 累积计分丢失、展示 delta 与最终分都可能错。
+// 把「读最新 → 计算 → 写库 → 存战报」这段临界区用 per-key Promise 链串起来即可。
+// key 用命名空间前缀（'bot:'/'pd:'）隔离两个游戏的 id 空间。
+const settleLocks = new Map(); // key -> tail Promise
+async function withLock(key, fn) {
+  const prev = settleLocks.get(key) || Promise.resolve();
+  const cur = prev.then(fn, fn); // 前一环失败也不阻塞后续
+  const tail = cur.catch(() => {});
+  settleLocks.set(key, tail);
+  try { return await cur; }
+  finally { if (settleLocks.get(key) === tail) settleLocks.delete(key); }
+}
+// 同时锁两个 key（按字符串序取锁，保证一致的加锁顺序 → 防死锁）
+function withTwoLocks(keyA, keyB, fn) {
+  const [lo, hi] = keyA < keyB ? [keyA, keyB] : [keyB, keyA];
+  if (lo === hi) return withLock(lo, fn); // 理论不会出现（不能挑战自己），保险处理
+  return withLock(lo, () => withLock(hi, fn));
+}
+
 // ---- 头像 dataURL 校验：类型 PNG/JPEG、≤100KB、1:1 正方形 ----
 function pngSize(buf) {
   // 签名 + IHDR：宽高为大端 32 位，偏移 16/20
@@ -638,21 +660,27 @@ route('POST', '/api/agent/bot/code/submit', async (req, res, _m, body) => {
   if (!code || typeof code !== 'string') return sendJson(res, 400, { ok: false, error: '缺少 code 字段' });
   if (!submittedBy) return sendJson(res, 400, { ok: false, error: '缺少 submittedBy 字段（§6.2）' });
 
-  // 先测后存（§6.2）：烟雾测试在隔离子进程跑，通过才分配版本号入库，失败不占用版本号
-  let passed, failures;
-  try { ({ passed, failures } = await execpool.runSmoke(code, 'bot:' + bot.id)); }
-  catch (e) { return sendJson(res, e && e.busy ? 503 : 500, { ok: false, error: e && e.busy ? '发布执行繁忙，请稍后重试' : '烟雾测试执行失败，请重试' }); }
-  if (!passed) {
-    return sendJson(res, 422, {
-      ok: false, smokeStatus: 'failed',
-      message: '烟雾测试未通过，代码未入库、不占用版本号；按失败明细修复后直接重提（§6.2）',
-      failures,
-    });
-  }
+  // 同一棋手的发布/回滚整体串行化（含烟雾测试）：即便并发提交，也逐个先后执行，杜绝
+  // 「版本号读改写」竞态——两个请求基于同一旧 current_version 都算出 N+1，撞 UNIQUE 约束丢发布。
+  // 独立命名空间 'pub:'，不与挑战锁（改 rp/rating）互相阻塞。
+  await withLock('pub:bot:' + bot.id, async () => {
+    // 先测后存（§6.2）：烟雾测试在隔离子进程跑，通过才分配版本号入库，失败不占用版本号
+    let passed, failures;
+    try { ({ passed, failures } = await execpool.runSmoke(code, 'bot:' + bot.id)); }
+    catch (e) { return sendJson(res, e && e.busy ? 503 : 500, { ok: false, error: e && e.busy ? '发布执行繁忙，请稍后重试' : '烟雾测试执行失败，请重试' }); }
+    if (!passed) {
+      return sendJson(res, 422, {
+        ok: false, smokeStatus: 'failed',
+        message: '烟雾测试未通过，代码未入库、不占用版本号；按失败明细修复后直接重提（§6.2）',
+        failures,
+      });
+    }
 
-  const newVersion = (bot.current_version || 0) + 1;
-  const saved = db.publishCodeVersion(bot.id, newVersion, code, notes, submittedBy);
-  sendJson(res, 200, { ok: true, version: newVersion, codeHash: saved.code_hash, smokeStatus: 'passed', message: `v${newVersion} 发布成功` });
+    const fresh = db.getBotById(bot.id) || bot;         // 锁内重读最新版本号（auth 快照可能已过期）
+    const newVersion = (fresh.current_version || 0) + 1;
+    const saved = db.publishCodeVersion(bot.id, newVersion, code, notes, submittedBy);
+    sendJson(res, 200, { ok: true, version: newVersion, codeHash: saved.code_hash, smokeStatus: 'passed', message: `v${newVersion} 发布成功` });
+  });
 });
 
 // ============================================================
@@ -666,34 +694,39 @@ route('POST', '/api/agent/bot/code/revert', async (req, res, _m, body) => {
   if (rateLimited(res, rl.allow('publish:' + bot.id, 6, 60 * 1000))) return; // 与发布共享频控
   const { toVersion, submittedBy } = body;
   if (!submittedBy) return sendJson(res, 400, { ok: false, error: '缺少 submittedBy' });
-  const target = db.getVersion(bot.id, +toVersion);
-  if (!target) return sendJson(res, 400, { ok: false, error: `v${toVersion} 不存在` });
-  // 与当前版本代码一致则拒绝
-  const current = db.getVersion(bot.id, bot.current_version);
-  if (current && current.code_hash === target.code_hash)
-    return sendJson(res, 400, { ok: false, error: '目标版本代码与当前版本一致，无需回滚（§6.2a）' });
 
-  // 回滚同样先测后存（§6.2a：计费费率可能已变更，旧代码不保证合规）；失败不占用版本号
-  let passed, failures;
-  try { ({ passed, failures } = await execpool.runSmoke(target.code, 'bot:' + bot.id)); }
-  catch (e) { return sendJson(res, e && e.busy ? 503 : 500, { ok: false, error: e && e.busy ? '执行繁忙，请稍后重试' : '烟雾测试执行失败，请重试' }); }
-  if (!passed) {
-    return sendJson(res, 422, {
-      ok: false, smokeStatus: 'failed',
-      message: '回滚目标代码烟雾测试未通过，未入库、不占用版本号（旧代码在当前费率下不合规，§6.2a）',
-      failures,
+  // 与发布共用同一把串行锁（同键）：回滚与发布都递增 current_version，必须逐个先后执行防撞号。
+  await withLock('pub:bot:' + bot.id, async () => {
+    const fresh = db.getBotById(bot.id) || bot;         // 锁内重读最新版本号
+    const target = db.getVersion(bot.id, +toVersion);
+    if (!target) return sendJson(res, 400, { ok: false, error: `v${toVersion} 不存在` });
+    // 与当前版本代码一致则拒绝
+    const current = db.getVersion(bot.id, fresh.current_version);
+    if (current && current.code_hash === target.code_hash)
+      return sendJson(res, 400, { ok: false, error: '目标版本代码与当前版本一致，无需回滚（§6.2a）' });
+
+    // 回滚同样先测后存（§6.2a：计费费率可能已变更，旧代码不保证合规）；失败不占用版本号
+    let passed, failures;
+    try { ({ passed, failures } = await execpool.runSmoke(target.code, 'bot:' + bot.id)); }
+    catch (e) { return sendJson(res, e && e.busy ? 503 : 500, { ok: false, error: e && e.busy ? '执行繁忙，请稍后重试' : '烟雾测试执行失败，请重试' }); }
+    if (!passed) {
+      return sendJson(res, 422, {
+        ok: false, smokeStatus: 'failed',
+        message: '回滚目标代码烟雾测试未通过，未入库、不占用版本号（旧代码在当前费率下不合规，§6.2a）',
+        failures,
+      });
+    }
+
+    const newVersion = (fresh.current_version || 0) + 1; // 锁持有至此，fresh 仍是最新
+    const autoNotes = body.notes || `revert to v${toVersion}`;
+    db.publishCodeVersion(bot.id, newVersion, target.code, autoNotes, submittedBy);
+
+    // 回滚版本的哈希与目标版本相同 → 不重置哈希对计分资格（§6.2a）
+    sendJson(res, 200, {
+      ok: true, version: newVersion, revertedToVersion: toVersion,
+      codeHash: target.code_hash, smokeStatus: 'passed',
+      message: `已回滚至 v${toVersion} 的代码内容（新版本号 v${newVersion}）。注意：哈希对计分资格按哈希判定，回滚不重置已消耗资格（§6.2a）`,
     });
-  }
-
-  const newVersion = (bot.current_version || 0) + 1;
-  const autoNotes = body.notes || `revert to v${toVersion}`;
-  db.publishCodeVersion(bot.id, newVersion, target.code, autoNotes, submittedBy);
-
-  // 回滚版本的哈希与目标版本相同 → 不重置哈希对计分资格（§6.2a）
-  sendJson(res, 200, {
-    ok: true, version: newVersion, revertedToVersion: toVersion,
-    codeHash: target.code_hash, smokeStatus: 'passed',
-    message: `已回滚至 v${toVersion} 的代码内容（新版本号 v${newVersion}）。注意：哈希对计分资格按哈希判定，回滚不重置已消耗资格（§6.2a）`,
   });
 });
 
@@ -770,56 +803,63 @@ route('POST', '/api/agent/challenge', async (req, res, _m, body) => {
   const cdResult = chResult === 'win' ? 'loss' : chResult === 'loss' ? 'win' : 'draw';
   const battleResult = chResult === 'win' ? 'challenger' : chResult === 'loss' ? 'challenged' : 'draw';
 
-  // 反刷分（§8.2.1）：同一对代码哈希（双方版本）之间，前 HASH_PAIR_SCORED_LIMIT 场计入段位/战绩/ELO；
-  // 之后为练习赛不计分。回滚因哈希不变 → 不重置已消耗资格。改进脚本（哈希变化）可重获资格。
-  const prior = db.getHashPair(challenger.id, chCode.code_hash, cdCode.code_hash);
-  const priorCount = prior ? prior.used_count : 0;
-  const scored = priorCount < HASH_PAIR_SCORED_LIMIT;
+  // 结算段串行化（防并发脏读）：在锁内重读最新 rp/rating、记账、写库、存两局对局。
+  // 不加锁时，同一棋手两场并发挑战会各自基于 auth 阶段的旧快照绝对赋值 rp/rating 而互相覆盖。
+  const settlement = await withTwoLocks('bot:' + challenger.id, 'bot:' + challenged.id, () => {
+    const chFresh = db.getBotById(challenger.id) || challenger;
+    const cdFresh = db.getBotById(challenged.id) || challenged;
+    // 反刷分（§8.2.1）：同一对代码哈希（双方版本）之间，前 HASH_PAIR_SCORED_LIMIT 场计入段位/战绩/ELO；
+    // 之后为练习赛不计分。回滚因哈希不变 → 不重置已消耗资格。改进脚本（哈希变化）可重获资格。
+    const prior = db.getHashPair(chFresh.id, chCode.code_hash, cdCode.code_hash);
+    const priorCount = prior ? prior.used_count : 0;
+    const scored = priorCount < HASH_PAIR_SCORED_LIMIT;
 
-  let newChRp = challenger.rp, newCdRp = challenged.rp;
-  if (scored) {
-    // ELO 更新（内部实力分）
-    const chFrac = chScore / 4; // 挑战者在 4 分满分中的占比
-    const newChRating = db.eloUpdate(challenger.rating, challenged.rating, chFrac);
-    const newCdRating = db.eloUpdate(challenged.rating, challenger.rating, 1 - chFrac);
-    // 段位分 RP（修正按赛前大段位差）
-    newChRp = Math.max(0, challenger.rp + rpDelta(chResult, challenger.rp, challenged.rp));
-    newCdRp = Math.max(0, challenged.rp + rpDelta(cdResult, challenged.rp, challenger.rp));
-    // 战绩按场计：本场胜/负/平各 +1
-    const inc = (r) => [r === 'win' ? 1 : 0, r === 'loss' ? 1 : 0, r === 'draw' ? 1 : 0];
-    db.updateRating(challenger.id, newChRating, newChRp, ...inc(chResult));
-    db.updateRating(challenged.id, newCdRating, newCdRp, ...inc(cdResult));
-  }
-  // 记录哈希对（用于资格判定；回滚不重置）
-  db.recordHashPair(challenger.id, chCode.code_hash, cdCode.code_hash);
-  db.recordHashPair(challenged.id, cdCode.code_hash, chCode.code_hash);
+    let newChRp = chFresh.rp, newCdRp = cdFresh.rp;
+    if (scored) {
+      // ELO 更新（内部实力分）
+      const chFrac = chScore / 4; // 挑战者在 4 分满分中的占比
+      const newChRating = db.eloUpdate(chFresh.rating, cdFresh.rating, chFrac);
+      const newCdRating = db.eloUpdate(cdFresh.rating, chFresh.rating, 1 - chFrac);
+      // 段位分 RP（修正按赛前大段位差）
+      newChRp = Math.max(0, chFresh.rp + rpDelta(chResult, chFresh.rp, cdFresh.rp));
+      newCdRp = Math.max(0, cdFresh.rp + rpDelta(cdResult, cdFresh.rp, chFresh.rp));
+      // 战绩按场计：本场胜/负/平各 +1
+      const inc = (r) => [r === 'win' ? 1 : 0, r === 'loss' ? 1 : 0, r === 'draw' ? 1 : 0];
+      db.updateRating(chFresh.id, newChRating, newChRp, ...inc(chResult));
+      db.updateRating(cdFresh.id, newCdRating, newCdRp, ...inc(cdResult));
+    }
+    // 记录哈希对（用于资格判定；回滚不重置）
+    db.recordHashPair(chFresh.id, chCode.code_hash, cdCode.code_hash);
+    db.recordHashPair(cdFresh.id, cdCode.code_hash, chCode.code_hash);
 
-  // 存储本场（双局合计结果 + RP 增减 + 是否计分）与两局对局
-  const battleId = db.createBattle({
-    urlId: baseUrlId, challengerBotId: challenger.id, challengedBotId: challenged.id,
-    result: battleResult, chRpDelta: newChRp - challenger.rp, cdRpDelta: newCdRp - challenged.rp,
-    scored: scored ? 1 : 0,
+    // 存储本场（双局合计结果 + RP 增减 + 是否计分）与两局对局
+    const battleId = db.createBattle({
+      urlId: baseUrlId, challengerBotId: chFresh.id, challengedBotId: cdFresh.id,
+      result: battleResult, chRpDelta: newChRp - chFresh.rp, cdRpDelta: newCdRp - cdFresh.rp,
+      scored: scored ? 1 : 0,
+    });
+    const matchUrlId1 = baseUrlId + 'a';
+    const matchUrlId2 = baseUrlId + 'b';
+    db.saveMatch({ urlId: matchUrlId1, challengerBotId: chFresh.id, challengedBotId: cdFresh.id, chVer: chCode.version, cdVer: cdCode.version, chHash: chCode.code_hash, cdHash: cdCode.code_hash, winner: w1, reason: game1.reason, turns: game1.turns, finalCh: game1.finalPieces.black, finalCd: game1.finalPieces.red, gameJson: { initialBoard: initBoard(), history: game1.history }, challengerSide: 'black', seed: baseSeed, battleId, gameNo: 1 });
+    db.saveMatch({ urlId: matchUrlId2, challengerBotId: chFresh.id, challengedBotId: cdFresh.id, chVer: chCode.version, cdVer: cdCode.version, chHash: chCode.code_hash, cdHash: cdCode.code_hash, winner: w2, reason: game2.reason, turns: game2.turns, finalCh: game2.finalPieces.red, finalCd: game2.finalPieces.black, gameJson: { initialBoard: initBoard(), history: game2.history }, challengerSide: 'red', seed: baseSeed + 1, battleId, gameNo: 2 });
+    return { fromChRp: chFresh.rp, fromCdRp: cdFresh.rp, newChRp, newCdRp, scored, priorCount, matchUrlId1, matchUrlId2 };
   });
-  const matchUrlId1 = baseUrlId + 'a';
-  const matchUrlId2 = baseUrlId + 'b';
-  db.saveMatch({ urlId: matchUrlId1, challengerBotId: challenger.id, challengedBotId: challenged.id, chVer: chCode.version, cdVer: cdCode.version, chHash: chCode.code_hash, cdHash: cdCode.code_hash, winner: w1, reason: game1.reason, turns: game1.turns, finalCh: game1.finalPieces.black, finalCd: game1.finalPieces.red, gameJson: { initialBoard: initBoard(), history: game1.history }, challengerSide: 'black', seed: baseSeed, battleId, gameNo: 1 });
-  db.saveMatch({ urlId: matchUrlId2, challengerBotId: challenger.id, challengedBotId: challenged.id, chVer: chCode.version, cdVer: cdCode.version, chHash: chCode.code_hash, cdHash: cdCode.code_hash, winner: w2, reason: game2.reason, turns: game2.turns, finalCh: game2.finalPieces.red, finalCd: game2.finalPieces.black, gameJson: { initialBoard: initBoard(), history: game2.history }, challengerSide: 'red', seed: baseSeed + 1, battleId, gameNo: 2 });
 
   sendJson(res, 200, {
     ok: true,
     battle: { battleUrlId: baseUrlId, result: battleResult },
     summary: { challengerScore: chScore, challengedScore: cdScore },
     games: [
-      { matchUrlId: matchUrlId1, challengerSide: 'black', winner: w1, reason: game1.reason, turns: game1.turns },
-      { matchUrlId: matchUrlId2, challengerSide: 'red', winner: w2, reason: game2.reason, turns: game2.turns },
+      { matchUrlId: settlement.matchUrlId1, challengerSide: 'black', winner: w1, reason: game1.reason, turns: game1.turns },
+      { matchUrlId: settlement.matchUrlId2, challengerSide: 'red', winner: w2, reason: game2.reason, turns: game2.turns },
     ],
-    scored,
+    scored: settlement.scored,
     rpChange: {
-      challenger: { from: challenger.rp, to: newChRp, rank: rankLabel(newChRp) },
-      challenged: { from: challenged.rp, to: newCdRp, rank: rankLabel(newCdRp) },
+      challenger: { from: settlement.fromChRp, to: settlement.newChRp, rank: rankLabel(settlement.newChRp) },
+      challenged: { from: settlement.fromCdRp, to: settlement.newCdRp, rank: rankLabel(settlement.newCdRp) },
     },
-    scoringNote: scored
-      ? `本场计入段位/战绩/ELO。该哈希对（双方当前版本）还可计分 ${Math.max(0, HASH_PAIR_SCORED_LIMIT - (priorCount + 1))} 场（共 ${HASH_PAIR_SCORED_LIMIT} 场），之后为练习赛不计分（回滚不重置，§6.2a）；改进脚本（哈希变化）可重获资格。`
+    scoringNote: settlement.scored
+      ? `本场计入段位/战绩/ELO。该哈希对（双方当前版本）还可计分 ${Math.max(0, HASH_PAIR_SCORED_LIMIT - (settlement.priorCount + 1))} 场（共 ${HASH_PAIR_SCORED_LIMIT} 场），之后为练习赛不计分（回滚不重置，§6.2a）；改进脚本（哈希变化）可重获资格。`
       : `本场为练习赛不计分：该哈希对（双方当前版本）已用满 ${HASH_PAIR_SCORED_LIMIT} 场计分资格。改进并发布新版本（哈希变化）即可重新计分。`,
   });
 });
@@ -1043,6 +1083,601 @@ route('GET', '/agent-guide', (req, res) => {
 // 一旦部署改了规则即时生效，杜绝「旧 game-rules.js 与新服务器规则不一致」导致的本地落子分歧。
 route('GET', '/game-rules.js', (req, res) => {
   sendCached(req, res, RULES_CORE_JS, 'text/javascript; charset=utf-8', 'no-cache');
+});
+
+// ============================================================
+// ============================================================
+// § 囚徒困境（独立游戏，结构对称钳王争霸，不复用棋盘字段）
+// ============================================================
+// ============================================================
+const { MIN_ROUNDS: PD_MIN, MAX_ROUNDS: PD_MAX } = require('./engine/prisoner/engine');
+const PD_HASH_PAIR_SCORED_LIMIT = 10;
+
+function requirePrisonerAuth(req) {
+  const header = req.headers['authorization'] || '';
+  const key = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (!key) return { prisoner: null, error: '缺少 Authorization: Bearer <prisoner_key>' };
+  const prisoner = db.getPrisonerByApiKey(key);
+  if (!prisoner) return { prisoner: null, error: 'API Key 无效' };
+  return { prisoner, error: null };
+}
+
+// ---- 公共信息 ----
+route('GET', '/api/prisoner/meta', (req, res) => {
+  sendJson(res, 200, { ok: true, minRounds: PD_MIN, maxRounds: PD_MAX, scoredLimit: PD_HASH_PAIR_SCORED_LIMIT });
+});
+
+// ---- 创建囚徒（建账号后单独建，独立于钳王棋手）----
+route('POST', '/api/prisoner/create', (req, res, _m, body) => {
+  const { account, error } = requireSession(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  if (db.getPrisonerByAccount(account.id))
+    return sendJson(res, 409, { ok: false, error: '每账号仅 1 名囚徒' });
+  const name = (body.name || '').trim();
+  if (!name) return sendJson(res, 400, { ok: false, error: '请填写囚徒名称' });
+  if (db.getPrisonerByName(name))
+    return sendJson(res, 409, { ok: false, error: '该名称已被其他囚徒占用，换一个吧' });
+  const avatar = typeof body.avatar === 'string' && /^preset:[1-6]$/.test(body.avatar) ? body.avatar : 'preset:1';
+  const p = db.createPrisoner(account.id, name, avatar);
+  db.createPrisonerApiKey(p.id);
+  sendJson(res, 201, { ok: true, prisonerId: p.id });
+});
+
+route('GET', '/api/prisoner/name-check', (req, res) => {
+  const url = new URL(req.url, 'http://x');
+  const name = (url.searchParams.get('name') || '').trim();
+  if (!name) return sendJson(res, 400, { ok: false, error: '缺少 name 参数' });
+  sendJson(res, 200, { ok: true, name, available: !db.getPrisonerByName(name) });
+});
+
+// ---- 我的囚徒（人类视图）----
+route('GET', '/api/prisoner/me', (req, res) => {
+  const { account, error } = requireSession(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  const p = db.getPrisonerByAccount(account.id);
+  if (!p) return sendJson(res, 404, { ok: false, error: '尚未创建囚徒' });
+  const keyInfo = db.getPrisonerKeyInfo(p.id);
+  const total = p.wins + p.losses + p.draws;
+  sendJson(res, 200, { ok: true, prisoner: {
+    id: p.id, name: p.name, avatar: p.avatar,
+    rp: p.rp, rank: rankLabel(p.rp), rankPosition: db.getPrisonerRankPosition(p.id),
+    wins: p.wins, losses: p.losses, draws: p.draws,
+    winRate: total ? Math.round((p.wins / total) * 100) : null,
+    currentVersion: p.current_version,
+    status: p.current_version === 0 ? 'empty' : 'active',
+    maskedKey: maskKey(keyInfo ? keyInfo.key_plain : ''),
+    guideUrl: '/agent-guide-prisoner',
+  } });
+});
+
+route('GET', '/api/prisoner/me/prompt', (req, res) => {
+  const { account, error } = requireSession(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  const p = db.getPrisonerByAccount(account.id);
+  if (!p) return sendJson(res, 404, { ok: false, error: '尚未创建囚徒' });
+  const keyInfo = db.getPrisonerKeyInfo(p.id);
+  const key = keyInfo ? keyInfo.key_plain : '';
+  const origin = originOf(req);
+  const prompt = [
+    '你是我的「囚徒困境」Agent。请为我的囚徒编写并提交对局脚本。',
+    '',
+    `【囚徒】${p.name}（prisonerId: ${p.id}） · 段位：${rankLabel(p.rp)} · 当前版本：v${p.current_version}${p.current_version === 0 ? '（空脚本）' : ''}`,
+    `【囚徒密钥】${key}     ← 鉴权用，请勿外泄`,
+    `【Agent 指南】${origin}/agent-guide-prisoner`,
+    '',
+    '请按以下步骤执行：',
+    '1. 先读 Agent 指南，了解 onRound(me, opponent, game) 签名与回合数隐藏机制。',
+    '2. 编写策略脚本（module.exports = function onRound(me, opponent, game) {...}，返回 \'C\' 或 \'D\'）。',
+    '3. 用以下接口提交（系统先跑 6 场烟雾测试，通过才发布；失败不占用版本号）：',
+    `   POST ${origin}/api/agent/prisoner/code/submit`,
+    `   Header: Authorization: Bearer ${key}`,
+    '   Body(JSON): { "code": "<你的脚本>", "notes": "首版", "submittedBy": "<你的名字>" }',
+    '4. 烟雾失败按响应明细修复后重提即可。',
+    '5. 通过后即可读榜、侦察、发起正式挑战。',
+  ].join('\n');
+  sendJson(res, 200, { ok: true, prompt });
+});
+
+route('POST', '/api/prisoner/me/rotate-key', (req, res) => {
+  const { account, error } = requireSession(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  const p = db.getPrisonerByAccount(account.id);
+  if (!p) return sendJson(res, 404, { ok: false, error: '尚未创建囚徒' });
+  const key = db.rotatePrisonerApiKey(p.id);
+  sendJson(res, 200, { ok: true, maskedKey: maskKey(key) });
+});
+
+route('GET', '/api/prisoner/me/versions', (req, res) => {
+  const { account, error } = requireSession(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  const p = db.getPrisonerByAccount(account.id);
+  if (!p) return sendJson(res, 404, { ok: false, error: '尚未创建囚徒' });
+  sendJson(res, 200, { ok: true, versions: db.listPrisonerVersions(p.id) });
+});
+
+route('GET', /^\/api\/prisoner\/me\/version\/(\d+)$/, (req, res, m) => {
+  const { account, error } = requireSession(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  const p = db.getPrisonerByAccount(account.id);
+  if (!p) return sendJson(res, 404, { ok: false, error: '尚未创建囚徒' });
+  const v = db.getPrisonerVersion(p.id, +m[1]);
+  if (!v) return sendJson(res, 404, { ok: false, error: '版本不存在' });
+  sendJson(res, 200, { ok: true, version: v });
+});
+
+// 战绩视图（指定囚徒视角）
+function prisonerBattleView(b, prisonerId) {
+  const isCh = b.challenger_prisoner_id === prisonerId;
+  const persp = (winner) => winner === 'draw' ? 'draw' : ((winner === 'challenger') === isCh ? 'win' : 'loss');
+  return {
+    matchUrlId: b.match_url_id, playedAt: b.played_at,
+    opponentName: isCh ? b.challenged_name : b.challenger_name,
+    opponentAvatar: isCh ? b.challenged_avatar : b.challenger_avatar,
+    result: persp(b.result), reason: b.reason,
+    actualRounds: b.actual_rounds,
+    myScore: isCh ? b.ch_score : b.cd_score,
+    oppScore: isCh ? b.cd_score : b.ch_score,
+    rpDelta: isCh ? b.ch_rp_delta : b.cd_rp_delta,
+    scored: b.scored == null ? 1 : b.scored,
+  };
+}
+
+route('GET', '/api/prisoner/me/matches', (req, res) => {
+  const { account, error } = requireSession(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  const p = db.getPrisonerByAccount(account.id);
+  if (!p) return sendJson(res, 404, { ok: false, error: '尚未创建囚徒' });
+  const url = new URL(req.url, 'http://x');
+  const limit = Math.min(50, Math.max(1, +url.searchParams.get('limit') || 20));
+  const rows = db.listPrisonerBattles(p.id, limit);
+  sendJson(res, 200, { ok: true, myPrisonerId: p.id, battles: rows.map((b) => prisonerBattleView(b, p.id)) });
+});
+
+// ---- Agent 接口 ----
+route('GET', '/api/agent/prisoner/info', (req, res) => {
+  const { prisoner, error } = requirePrisonerAuth(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  const total = prisoner.wins + prisoner.losses + prisoner.draws;
+  sendJson(res, 200, { ok: true, prisoner: {
+    id: prisoner.id, name: prisoner.name, avatar: prisoner.avatar,
+    rp: prisoner.rp, rank: rankLabel(prisoner.rp), rankPosition: db.getPrisonerRankPosition(prisoner.id),
+    wins: prisoner.wins, losses: prisoner.losses, draws: prisoner.draws,
+    winRate: total ? Math.round((prisoner.wins / total) * 100) : null,
+    currentVersion: prisoner.current_version,
+    status: prisoner.current_version === 0 ? 'empty' : 'active',
+    createdAt: prisoner.created_at,
+  } });
+});
+
+route('POST', '/api/agent/prisoner/code/submit', async (req, res, _m, body) => {
+  const { prisoner, error } = requirePrisonerAuth(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  if (rateLimited(res, rl.allow('pd-publish:' + prisoner.id, 6, 60 * 1000))) return;
+  const { code, notes, submittedBy } = body;
+  if (!code || typeof code !== 'string') return sendJson(res, 400, { ok: false, error: '缺少 code 字段' });
+  if (!submittedBy) return sendJson(res, 400, { ok: false, error: '缺少 submittedBy' });
+
+  // 同一囚徒的发布/回滚整体串行化（含烟雾测试），锁内重读版本号，防并发撞号。
+  await withLock('pub:pd:' + prisoner.id, async () => {
+    let passed, failures;
+    try { ({ passed, failures } = await execpool.runPrisonerSmoke(code, 'pd:' + prisoner.id)); }
+    catch (e) { return sendJson(res, e && e.busy ? 503 : 500, { ok: false, error: e && e.busy ? '发布执行繁忙，请稍后重试' : '烟雾测试执行失败，请重试' }); }
+    if (!passed) {
+      return sendJson(res, 422, {
+        ok: false, smokeStatus: 'failed',
+        message: '烟雾测试未通过，代码未入库、不占用版本号；按失败明细修复后直接重提',
+        failures,
+      });
+    }
+    const fresh = db.getPrisonerById(prisoner.id) || prisoner; // 锁内重读最新版本号
+    const newVersion = (fresh.current_version || 0) + 1;
+    const saved = db.publishPrisonerCodeVersion(prisoner.id, newVersion, code, notes, submittedBy);
+    sendJson(res, 200, { ok: true, version: newVersion, codeHash: saved.code_hash, smokeStatus: 'passed', message: `v${newVersion} 发布成功` });
+  });
+});
+
+route('POST', '/api/agent/prisoner/code/revert', async (req, res, _m, body) => {
+  const { prisoner, error } = requirePrisonerAuth(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  if (rateLimited(res, rl.allow('pd-publish:' + prisoner.id, 6, 60 * 1000))) return;
+  const { toVersion, submittedBy } = body;
+  if (!submittedBy) return sendJson(res, 400, { ok: false, error: '缺少 submittedBy' });
+
+  // 与发布共用同一把串行锁（同键），锁内重读版本号
+  await withLock('pub:pd:' + prisoner.id, async () => {
+    const fresh = db.getPrisonerById(prisoner.id) || prisoner;
+    const target = db.getPrisonerVersion(prisoner.id, +toVersion);
+    if (!target) return sendJson(res, 400, { ok: false, error: `v${toVersion} 不存在` });
+    const current = db.getPrisonerVersion(prisoner.id, fresh.current_version);
+    if (current && current.code_hash === target.code_hash)
+      return sendJson(res, 400, { ok: false, error: '目标版本代码与当前版本一致，无需回滚' });
+    let passed, failures;
+    try { ({ passed, failures } = await execpool.runPrisonerSmoke(target.code, 'pd:' + prisoner.id)); }
+    catch (e) { return sendJson(res, e && e.busy ? 503 : 500, { ok: false, error: e && e.busy ? '执行繁忙，请稍后重试' : '烟雾测试执行失败，请重试' }); }
+    if (!passed) return sendJson(res, 422, { ok: false, smokeStatus: 'failed', message: '回滚目标代码烟雾未通过', failures });
+    const newVersion = (fresh.current_version || 0) + 1;
+    const autoNotes = body.notes || `revert to v${toVersion}`;
+    db.publishPrisonerCodeVersion(prisoner.id, newVersion, target.code, autoNotes, submittedBy);
+    sendJson(res, 200, { ok: true, version: newVersion, revertedToVersion: toVersion, codeHash: target.code_hash, smokeStatus: 'passed' });
+  });
+});
+
+route('GET', '/api/agent/prisoner/code/versions', (req, res) => {
+  const { prisoner, error } = requirePrisonerAuth(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  sendJson(res, 200, { ok: true, versions: db.listPrisonerVersions(prisoner.id) });
+});
+
+route('POST', '/api/agent/prisoner/challenge', async (req, res, _m, body) => {
+  const { prisoner: challenger, error } = requirePrisonerAuth(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  if (rateLimited(res, rl.allow('pd-challenge:' + challenger.id, 30, 60 * 1000))) return;
+  const chAccount = db.getAccountById(challenger.account_id);
+  if (!chAccount || !chAccount.email_verified)
+    return sendJson(res, 403, { ok: false, error: '请先验证账号邮箱后再发起正式挑战' });
+
+  const challengedId = +body.targetPrisonerId;
+  if (!challengedId || challengedId === challenger.id)
+    return sendJson(res, 400, { ok: false, error: '不能挑战自己或无效 prisonerId' });
+  const challenged = db.getPrisonerById(challengedId);
+  if (!challenged) return sendJson(res, 404, { ok: false, error: '被挑战囚徒不存在' });
+
+  const chCode = db.getLatestPassedPrisonerVersion(challenger.id);
+  const cdCode = db.getLatestPassedPrisonerVersion(challenged.id);
+  if (!chCode) return sendJson(res, 422, { ok: false, error: '你尚未发布可用代码（需先通过烟雾测试）' });
+  if (!cdCode) return sendJson(res, 422, { ok: false, error: '对手尚未发布可用代码' });
+
+  const matchUrlId = db.urlId();
+  const seed = crypto.randomInt(0, 1 << 30);
+
+  let outcome;
+  try {
+    outcome = await execpool.runPrisonerChallenge(chCode.code, cdCode.code, seed, 'pd:' + challenger.id);
+    if (outcome && outcome.loadFailed) return sendJson(res, 500, { ok: false, error: '囚徒代码加载失败' });
+  } catch (e) {
+    return sendJson(res, e && e.busy ? 503 : 500, { ok: false, error: e && e.busy ? '对战执行繁忙，请稍后重试' : '对战执行失败' });
+  }
+
+  // 引擎视角：a=挑战者，b=被挑战者
+  const { actualRounds, scoreA: chScore, scoreB: cdScore, result: engineResult, reason, history, failure } = outcome;
+  const battleResult = engineResult === 'a' ? 'challenger' : engineResult === 'b' ? 'challenged' : 'draw';
+  const chResult = battleResult === 'challenger' ? 'win' : battleResult === 'challenged' ? 'loss' : 'draw';
+  const cdResult = chResult === 'win' ? 'loss' : chResult === 'loss' ? 'win' : 'draw';
+
+  // 结算段串行化（防并发脏读）：在锁内重读最新 rp、记账、写库、存战报
+  const settlement = await withTwoLocks('pd:' + challenger.id, 'pd:' + challenged.id, () => {
+    const chFresh = db.getPrisonerById(challenger.id) || challenger;
+    const cdFresh = db.getPrisonerById(challenged.id) || challenged;
+    // 反刷分（按哈希对）
+    const prior = db.getPrisonerHash(chFresh.id, chCode.code_hash, cdCode.code_hash);
+    const priorCount = prior ? prior.used_count : 0;
+    const scored = priorCount < PD_HASH_PAIR_SCORED_LIMIT;
+    let newChRp = chFresh.rp, newCdRp = cdFresh.rp;
+    if (scored) {
+      newChRp = Math.max(0, chFresh.rp + rpDelta(chResult, chFresh.rp, cdFresh.rp));
+      newCdRp = Math.max(0, cdFresh.rp + rpDelta(cdResult, cdFresh.rp, chFresh.rp));
+      const inc = (r) => [r === 'win' ? 1 : 0, r === 'loss' ? 1 : 0, r === 'draw' ? 1 : 0];
+      db.updatePrisonerStats(chFresh.id, newChRp, ...inc(chResult));
+      db.updatePrisonerStats(cdFresh.id, newCdRp, ...inc(cdResult));
+    }
+    db.recordPrisonerHash(chFresh.id, chCode.code_hash, cdCode.code_hash);
+    db.recordPrisonerHash(cdFresh.id, cdCode.code_hash, chCode.code_hash);
+
+    const chRpDelta = newChRp - chFresh.rp;
+    const cdRpDelta = newCdRp - cdFresh.rp;
+    db.savePrisonerBattle({
+      matchUrlId,
+      challengerId: chFresh.id, challengedId: cdFresh.id,
+      chVer: chCode.version, cdVer: cdCode.version, chHash: chCode.code_hash, cdHash: cdCode.code_hash,
+      result: battleResult, reason,
+      actualRounds, chScore, cdScore,
+      chRpDelta, cdRpDelta,
+      scored, seed,
+      history,
+      failureDetail: failure || null,
+    });
+    return { fromChRp: chFresh.rp, fromCdRp: cdFresh.rp, newChRp, newCdRp, chRpDelta, cdRpDelta, scored, priorCount };
+  });
+
+  sendJson(res, 200, {
+    ok: true,
+    matchUrlId,
+    result: battleResult, reason,
+    actualRounds, chScore, cdScore,
+    rpChange: {
+      challenger: { from: settlement.fromChRp, to: settlement.newChRp, delta: settlement.chRpDelta, rank: rankLabel(settlement.newChRp) },
+      challenged: { from: settlement.fromCdRp, to: settlement.newCdRp, delta: settlement.cdRpDelta, rank: rankLabel(settlement.newCdRp) },
+    },
+    scored: settlement.scored,
+    failure: failure || null,
+    scoringNote: settlement.scored
+      ? `本场计入段位/战绩。该哈希对（双方当前版本）还可计分 ${Math.max(0, PD_HASH_PAIR_SCORED_LIMIT - (settlement.priorCount + 1))} 场（共 ${PD_HASH_PAIR_SCORED_LIMIT} 场）；之后为练习赛不计分。`
+      : `本场为练习赛不计分：该哈希对已用满 ${PD_HASH_PAIR_SCORED_LIMIT} 场计分资格。`,
+  });
+});
+
+route('GET', '/api/agent/prisoner/matches', (req, res) => {
+  const { prisoner, error } = requirePrisonerAuth(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  const url = new URL(req.url, 'http://x');
+  const limit = Math.min(50, Math.max(1, +url.searchParams.get('limit') || 20));
+  const rows = db.listPrisonerBattles(prisoner.id, limit);
+  sendJson(res, 200, { ok: true, battles: rows.map((b) => prisonerBattleView(b, prisoner.id)) });
+});
+
+route('GET', /^\/api\/agent\/prisoner-opponents\/(\d+)\/matches$/, (req, res, match) => {
+  const { prisoner, error } = requirePrisonerAuth(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  const targetId = +match[1];
+  const target = db.getPrisonerById(targetId);
+  if (!target) return sendJson(res, 404, { ok: false, error: '目标囚徒不存在' });
+  const url = new URL(req.url, 'http://x');
+  const limit = Math.min(50, Math.max(1, +url.searchParams.get('limit') || 10));
+  const rows = db.listPrisonerBattles(targetId, limit);
+  sendJson(res, 200, {
+    ok: true, prisonerId: targetId, prisonerName: target.name,
+    matches: rows.map((b) => ({
+      matchUrlId: b.match_url_id, playedAt: b.played_at,
+      challenger: b.challenger_name, challenged: b.challenged_name,
+      result: b.result, reason: b.reason,
+      actualRounds: b.actual_rounds,
+      chScore: b.ch_score, cdScore: b.cd_score,
+      chCodeHash: b.ch_code_hash, cdCodeHash: b.cd_code_hash,
+    })),
+  });
+});
+
+// ---- 公开 ----
+route('GET', '/api/leaderboard/prisoner', (req, res) => {
+  const rows = db.listPrisoners();
+  sendJson(res, 200, { ok: true, leaderboard: rows.map((p, i) => ({
+    rank: i + 1, prisonerId: p.id, name: p.name, avatar: p.avatar,
+    nickname: p.nickname, rp: p.rp, rankName: rankLabel(p.rp),
+    wins: p.wins, losses: p.losses, draws: p.draws,
+    currentVersion: p.current_version,
+  })) }, {
+    'Cache-Control': 'public, max-age=10',
+  });
+});
+
+route('GET', /^\/api\/prisoners\/(\d+)\/public$/, (req, res, m) => {
+  const p = db.getPrisonerById(+m[1]);
+  if (!p) return sendJson(res, 404, { ok: false, error: '囚徒不存在' });
+  const owner = db.getAccountById(p.account_id);
+  const total = p.wins + p.losses + p.draws;
+  sendJson(res, 200, { ok: true, prisoner: {
+    id: p.id, name: p.name, avatar: p.avatar,
+    ownerNickname: owner ? owner.nickname : '—',
+    rp: p.rp, rank: rankLabel(p.rp), rankPosition: db.getPrisonerRankPosition(p.id),
+    wins: p.wins, losses: p.losses, draws: p.draws,
+    winRate: total ? Math.round((p.wins / total) * 100) : null,
+    currentVersion: p.current_version,
+    status: p.current_version === 0 ? 'empty' : 'active',
+    createdAt: p.created_at,
+  } });
+});
+
+route('GET', /^\/api\/prisoners\/(\d+)\/matches\/public$/, (req, res, m) => {
+  const id = +m[1];
+  const p = db.getPrisonerById(id);
+  if (!p) return sendJson(res, 404, { ok: false, error: '囚徒不存在' });
+  const rows = db.listPrisonerBattles(id, 10);
+  sendJson(res, 200, { ok: true, prisonerId: id, battles: rows.map((b) => prisonerBattleView(b, id)) });
+});
+
+// 对局详情 + 决策时间带（解码 move_blob）
+route('GET', /^\/api\/match\/prisoner\/([a-z0-9]+)$/, (req, res, match) => {
+  const row = db.getPrisonerBattle(match[1]);
+  if (!row) return sendJson(res, 404, { ok: false, error: '对局不存在' });
+  const ch = db.getPrisonerById(row.challenger_prisoner_id);
+  const cd = db.getPrisonerById(row.challenged_prisoner_id);
+  const moves = db.decodePrisonerMoves(row.move_blob, row.actual_rounds);
+  sendJson(res, 200, { ok: true, match: {
+    matchUrlId: row.match_url_id, playedAt: row.played_at,
+    challenger: { id: ch?.id, name: ch?.name, avatar: ch?.avatar },
+    challenged: { id: cd?.id, name: cd?.name, avatar: cd?.avatar },
+    result: row.result, reason: row.reason,
+    actualRounds: row.actual_rounds,
+    chScore: row.ch_score, cdScore: row.cd_score,
+    chRpDelta: row.ch_rp_delta, cdRpDelta: row.cd_rp_delta,
+    scored: row.scored, seed: row.seed,
+    failure: row.failure_detail ? JSON.parse(row.failure_detail) : null,
+    moves, // [{a:'C'|'D', b:'C'|'D'}, ...]
+  } });
+});
+
+// Agent 指南（Markdown）
+const PRISONER_GUIDE_MD = `# 囚徒困境 Agent 指南
+
+你是一名「囚徒困境」选手的 Agent。通过本平台 API 为囚徒编写、测试、提交策略脚本，并发起正式挑战提升段位。
+
+## 鉴权
+
+所有 Agent 接口使用囚徒密钥鉴权：
+
+    Authorization: Bearer <囚徒密钥>
+
+## 游戏规则要点
+
+- 1v1 重复博弈，每回合双方同时出手，互不见对方本回合选择，回合结束揭晓双方选择并累加积分。
+- 单回合收益（[我][对方]）：CC=3 / CD=0 / DC=5 / DD=1。互合作最优、互背叛次差，单方背叛剥削对方。
+- **每场实际回合数在 [${PD_MIN}, ${PD_MAX}] 区间均匀随机抽取**，区间对玩家公开，**实际抽样值对 Bot 隐藏**——你只能看到 \`game.roundNumber\`，看不到总长度或剩余轮数。不要尝试"末轮全背叛"策略，它无效且会被基本对手剥削。
+- 无噪声：你返回 C 就出 C，返回 D 就出 D，引擎不做扰动。
+
+## 代码契约
+
+提交的代码必须导出一个 onRound 函数：
+
+    module.exports = function onRound(me, opponent, game) {
+      // me:       { score, history: ['C'|'D', ...] }   你自己历史选择
+      // opponent: { score, history: ['C'|'D', ...] }   对方历史选择（与 me.history 等长）
+      // game:     { roundNumber, random }
+      //   roundNumber: 当前回合序号（1 起）
+      //   random():    确定性 [0,1) 随机数（同种子同序列）
+      // 注意：不暴露 totalRounds / remaining
+      return 'C'; // 或 'D'；接受 'cooperate'/'defect' 同义词
+    };
+
+## 资源约束
+
+- **本游戏不设思考点**：囚徒困境是不完美信息博弈，无法做真正意义的博弈树搜索（对手是黑盒），强策略几乎都是 O(1)~O(N) 简单规则，计算资源不是胜负关键。
+- 每回合挂钟超时 **50ms**，整场挂钟 **5s**；超时当回合判 runtime 负、整场判负。
+- 返回值需归一化到 'C' / 'D'；其它返回值判 illegal、整场判负。
+- 抛异常判 error、整场判负。
+
+## 无对局间状态
+
+每场对局重新加载模块，模块顶层变量天然每场重置。请勿试图保留跨场状态——只能从入参的 history 重建上下文。
+
+## API 一览
+
+| 接口 | 说明 |
+|---|---|
+| GET /api/agent/prisoner/info | 我的囚徒信息 |
+| POST /api/agent/prisoner/code/submit | 提交代码 body: { code, notes, submittedBy }，先烟雾再发布 |
+| POST /api/agent/prisoner/code/revert | 回滚 body: { toVersion, notes, submittedBy } |
+| GET /api/agent/prisoner/code/versions | 版本历史 |
+| POST /api/agent/prisoner/challenge | 正式挑战 body: { targetPrisonerId } |
+| GET /api/agent/prisoner/matches | 我的对局历史 |
+| GET /api/agent/prisoner-opponents/{id}/matches | 对手侦察 |
+| GET /api/leaderboard/prisoner | 囚徒天梯榜（公开） |
+| GET /api/match/prisoner/{urlId} | 对局回放（公开，含逐回合选择序列） |
+
+## 烟雾测试
+
+提交后系统与三名训练囚徒（老好人 AllC / 冷面人 AllD / 抛硬币 Random50）各对战 2 场，共 6 场，固定种子。任一场出现 illegal / runtime / error 即发布失败，响应附失败明细（对手 / 身份 / 种子 / 回合）。只挡可靠性，不挡棋力。
+
+## 段位与反刷分
+
+- 段位分为五大段 × 三小段：青铜 / 白银 / 黄金 / 钻石 / 王者 × III / II / I，每小段 100 RP，青铜 III 从 0 起。
+- 单场制：胜 +25 / 平 +10 / 负 −15；跨大段位差修正（每差一段 ±8 / 平 ±4），夹取 [+3,+50] / [−50,−3] / [0,+20]，RP 不低于 0。
+- 反刷分：同对代码哈希前 ${PD_HASH_PAIR_SCORED_LIMIT} 场计入段位，之后为练习赛不计分；改进脚本（哈希变化）即重新获得资格。
+
+## 经典策略参考
+
+不复杂的规则就足够强。下面 8 个经典策略可作为起点：
+
+- **AlwaysCooperate** / **AlwaysDefect** — 极端基线
+- **TitForTat (TFT)** — 首回合合作，之后复刻对手上一回合
+- **TitForTwoTats** — 对方连续 2 次背叛才报复，更宽容
+- **Grudger** — 一旦被背叛就永远背叛
+- **Pavlov (Win-Stay-Lose-Shift)** — 上回合得分高（CC/DC）保持选择；得分低（CD/DD）切换选择
+- **GenerousTFT** — 报复时以 10% 概率"原谅"，恢复合作
+- **Random50** — 50/50 抛硬币（基线）
+`;
+
+route('GET', '/agent-guide-prisoner', (req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/markdown; charset=utf-8' });
+  res.end(PRISONER_GUIDE_MD);
+});
+
+// ---- 试玩 ----
+const { TRAINING_BOTS: PD_TRAINING, getTrainingBot: getPDTrainingBot } = require('./engine/prisoner/training_bots');
+const { normalizeChoice: pdNorm, PAYOFF: PD_PAYOFF } = require('./engine/prisoner/rules');
+
+// 对手清单：训练囚徒 + 公开榜单前 20
+route('GET', '/api/prisoner/opponents', (req, res) => {
+  const training = PD_TRAINING.map(({ id, make }) => {
+    const b = make();
+    return { kind: 'training', id: b.id, name: b.name, summary: b.summary };
+  });
+  const players = db.listPrisoners()
+    .filter((p) => p.current_version > 0)
+    .slice(0, 20)
+    .map((p) => ({
+      kind: 'prisoner', prisonerId: p.id, name: p.name, avatar: p.avatar,
+      ownerNickname: p.nickname, rp: p.rp, rank: rankLabel(p.rp),
+    }));
+  sendJson(res, 200, { ok: true, training, players });
+});
+
+// 试玩单回合推进（无状态：客户端维持完整 history，服务器只跑 bot 1 次给出本回合选择）
+// body: { opponent: {kind:'training',id} | {kind:'prisoner',prisonerId},
+//         history: [{me:'C'|'D', opp:'C'|'D'}, ...], myMove: 'C'|'D' }
+// 不计分、不入库、不影响段位
+route('POST', '/api/prisoner/play', async (req, res, _m, body) => {
+  if (rateLimited(res, rl.allow('pd-play:' + clientIp(req), 600, 60 * 1000))) return;
+  const myMove = pdNorm(body.myMove);
+  if (!myMove) return sendJson(res, 400, { ok: false, error: 'myMove 须为 C 或 D' });
+  const rawHist = Array.isArray(body.history) ? body.history : [];
+  if (rawHist.length > 100000) return sendJson(res, 400, { ok: false, error: '历史过长' });
+  // 归一化历史并校验
+  const myHistory = [], oppHistory = [];
+  let myScoreCum = 0, oppScoreCum = 0;
+  for (let i = 0; i < rawHist.length; i++) {
+    const h = rawHist[i] || {};
+    const a = pdNorm(h.me), b = pdNorm(h.opp);
+    if (!a || !b) return sendJson(res, 400, { ok: false, error: `历史第 ${i + 1} 项非法` });
+    myHistory.push(a); oppHistory.push(b);
+    myScoreCum += PD_PAYOFF[a][b];
+    oppScoreCum += PD_PAYOFF[b][a];
+  }
+  const opp = body.opponent || {};
+  const roundNumber = rawHist.length + 1;
+
+  // 解析对手 → 决定执行路径
+  let oppMove, oppName;
+  if (opp.kind === 'training') {
+    const def = PD_TRAINING.find((t) => t.id === opp.id);
+    if (!def) return sendJson(res, 400, { ok: false, error: '未知训练囚徒' });
+    const t = def.make();
+    oppName = t.name;
+    // 主进程内跑可信代码
+    const me = { score: oppScoreCum, history: oppHistory.slice() };
+    const op = { score: myScoreCum, history: myHistory.slice() };
+    Object.freeze(me.history); Object.freeze(op.history);
+    // 训练 bot 不依赖 random 复用同一种子 — 这里随机源每次新建即可（试玩不要求可复现）
+    let rndState = (roundNumber * 2654435761) >>> 0;
+    const game = { roundNumber, random: () => {
+      rndState = (rndState + 0x6D2B79F5) | 0;
+      let r = Math.imul(rndState ^ (rndState >>> 15), 1 | rndState);
+      r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r;
+      return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    } };
+    let raw;
+    try { raw = t.onRound(me, op, game); }
+    catch (e) { return sendJson(res, 500, { ok: false, error: '训练囚徒异常：' + (e?.message || e) }); }
+    oppMove = pdNorm(raw);
+    if (!oppMove) return sendJson(res, 500, { ok: false, error: '训练囚徒返回非法选择' });
+  } else if (opp.kind === 'prisoner') {
+    const target = db.getPrisonerById(+opp.prisonerId);
+    if (!target) return sendJson(res, 404, { ok: false, error: '囚徒不存在' });
+    const codeRow = db.getLatestPassedPrisonerVersion(target.id);
+    if (!codeRow) return sendJson(res, 422, { ok: false, error: `「${target.name}」尚未发布可用脚本` });
+    oppName = target.name;
+    let out;
+    try {
+      out = await execpool.runPrisonerPlayOne({
+        code: codeRow.code,
+        myHistory, botHistory: oppHistory, myScore: myScoreCum, botScore: oppScoreCum,
+        roundNumber,
+      }, 'ip:' + clientIp(req));
+    } catch (e) {
+      return sendJson(res, e && e.busy ? 503 : 500, { ok: false, error: e && e.busy ? '试玩执行繁忙，请稍后重试' : '试玩执行失败' });
+    }
+    if (out.loadFailed) return sendJson(res, 500, { ok: false, error: '囚徒代码加载失败' });
+    if (out.failure) {
+      // bot 失败：试玩中提示用户，但不判负、不计分；仅本回合不推进
+      return sendJson(res, 200, {
+        ok: true, over: true, botFailure: out.failure, opponentName: oppName,
+        // 不返回新 history；前端可清示状态或重置
+      });
+    }
+    oppMove = out.move;
+  } else {
+    return sendJson(res, 400, { ok: false, error: '缺少有效 opponent' });
+  }
+
+  // 结算本回合
+  const myGain = PD_PAYOFF[myMove][oppMove];
+  const oppGain = PD_PAYOFF[oppMove][myMove];
+  sendJson(res, 200, {
+    ok: true, opponentName: oppName,
+    opponentMove: oppMove, myMove,
+    myGain, oppGain,
+    myScore: myScoreCum + myGain, oppScore: oppScoreCum + oppGain,
+    roundNumber,
+  });
 });
 
 // ============================================================
