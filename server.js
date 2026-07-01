@@ -480,7 +480,9 @@ route('POST', '/api/bot/me/avatar', (req, res, _m, body) => {
   }
   const fileName = `${bot.id}.${v.ext}`;
   fs.writeFileSync(path.join(AVATAR_DIR, fileName), v.buf);
-  const avatarVal = `upload:${fileName}`;
+  // 文件名保持稳定（覆盖旧内容），但在返回值上附一个版本戳作查询串 →
+  // 上传后 <img src> 变成新 URL，绕过浏览器 max-age=300 缓存。
+  const avatarVal = `upload:${fileName}?v=${Date.now()}`;
   db.updateBotAvatar(bot.id, avatarVal);
   sendJson(res, 200, { ok: true, avatar: avatarVal, url: `/avatars/${fileName}` });
 });
@@ -1128,6 +1130,39 @@ route('GET', '/api/prisoner/name-check', (req, res) => {
   const name = (url.searchParams.get('name') || '').trim();
   if (!name) return sendJson(res, 400, { ok: false, error: '缺少 name 参数' });
   sendJson(res, 200, { ok: true, name, available: !db.getPrisonerByName(name) });
+});
+
+// ---- 上传自定义头像 / 选用预设（囚徒；与棋手同一裁剪+校验流程）----
+route('POST', '/api/prisoner/me/avatar', (req, res, _m, body) => {
+  const { account, error } = requireSession(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  const p = db.getPrisonerByAccount(account.id);
+  if (!p) return sendJson(res, 404, { ok: false, error: '尚未创建囚徒' });
+  const v = validateAvatarDataUrl(body.dataUrl);
+  if (v.error) return sendJson(res, 400, { ok: false, error: v.error });
+  // 与棋手区分文件名前缀，避免 bot.id 与 prisoner.id 相同导致互相覆盖
+  for (const ext of ['png', 'jpg']) {
+    const old = path.join(AVATAR_DIR, `p${p.id}.${ext}`);
+    if (fs.existsSync(old)) fs.unlinkSync(old);
+  }
+  const fileName = `p${p.id}.${v.ext}`;
+  fs.writeFileSync(path.join(AVATAR_DIR, fileName), v.buf);
+  // 同 bot：附版本戳作查询串，绕过浏览器缓存
+  const avatarVal = `upload:${fileName}?v=${Date.now()}`;
+  db.updatePrisonerAvatar(p.id, avatarVal);
+  sendJson(res, 200, { ok: true, avatar: avatarVal, url: `/avatars/${fileName}` });
+});
+
+route('POST', '/api/prisoner/me/avatar/preset', (req, res, _m, body) => {
+  const { account, error } = requireSession(req);
+  if (error) return sendJson(res, 401, { ok: false, error });
+  const p = db.getPrisonerByAccount(account.id);
+  if (!p) return sendJson(res, 404, { ok: false, error: '尚未创建囚徒' });
+  const n = +body.preset;
+  if (!Number.isInteger(n) || n < 1 || n > 6) return sendJson(res, 400, { ok: false, error: 'preset 须为 1..6' });
+  const avatarVal = `preset:${n}`;
+  db.updatePrisonerAvatar(p.id, avatarVal);
+  sendJson(res, 200, { ok: true, avatar: avatarVal });
 });
 
 // ---- 我的囚徒（人类视图）----

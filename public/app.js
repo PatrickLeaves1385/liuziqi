@@ -120,8 +120,10 @@ function presetSvg(n) {
   return `<svg viewBox="0 0 40 40">${s}</svg>`;
 }
 function avatarHtml(avatar) {
+  // class av-img 让上传头像在任何容器里都铺满并等比裁切（object-fit:cover）——
+  // 否则 <img> 会按 256×256 原始尺寸渲染，被小容器的 overflow:hidden 截成左上角。
   if (typeof avatar === 'string' && avatar.startsWith('upload:'))
-    return `<img src="/avatars/${esc(avatar.slice(7))}" alt="头像" />`;
+    return `<img class="av-img" src="/avatars/${esc(avatar.slice(7))}" alt="头像" />`;
   const n = typeof avatar === 'string' && avatar.startsWith('preset:') ? +avatar.slice(7) : 1;
   return presetSvg(n);
 }
@@ -332,11 +334,12 @@ function renderMyBot() {
 }
 
 // ============================================================
-// 创建棋手 + 头像选择
+// 创建棋手 / 创建囚徒 + 头像选择（同一弹窗，按 kind 复用）
 // ============================================================
 let selectedAvatar = 'preset:1';
 let pendingUploadDataUrl = null;
-let avatarMode = 'create';
+// kind: 'bot'（棋手） | 'prisoner'（囚徒）；mode: 'create'（含名称）| 'edit'（仅头像）
+let avatarCtx = { kind: 'bot', mode: 'create' };
 
 function renderAvatarPicker() {
   const box = $('avatarPicker'); box.innerHTML = '';
@@ -363,14 +366,18 @@ function renderAvatarPicker() {
 async function onPickPreset(n) {
   selectedAvatar = 'preset:' + n; pendingUploadDataUrl = null;
   renderAvatarPicker();
-  if (avatarMode === 'edit') {
-    const r = await apiFetch('POST', '/api/bot/me/avatar/preset', { preset: n });
-    if (r.ok) { await refreshMe(); toast('头像已更新'); closeModal('createBotModal'); showDetail(); }
-    else toast(r.error || '更新失败');
+  if (avatarCtx.mode === 'edit') {
+    const url = avatarCtx.kind === 'prisoner' ? '/api/prisoner/me/avatar/preset' : '/api/bot/me/avatar/preset';
+    const r = await apiFetch('POST', url, { preset: n });
+    if (!r.ok) return toast(r.error || '更新失败');
+    toast('头像已更新');
+    closeModal('createBotModal');
+    if (avatarCtx.kind === 'prisoner') renderMyPrisoner();
+    else { await refreshMe(); showDetail(); }
   }
 }
 
-// 棋手名实时查重（创建前检查名称是否已被占用）
+// 棋手/囚徒名实时查重（创建前检查名称是否已被占用）
 let nameCheckTimer = null;
 $('bot-name').addEventListener('input', () => {
   const errEl = $('err-botname');
@@ -378,26 +385,55 @@ $('bot-name').addEventListener('input', () => {
   clearTimeout(nameCheckTimer);
   const name = $('bot-name').value.trim();
   if (!name) return;
+  const isPrisoner = avatarCtx.kind === 'prisoner';
+  const checkUrl = isPrisoner ? '/api/prisoner/name-check' : '/api/bot/name-check';
+  const busyMsg = isPrisoner ? '该名称已被其他囚徒占用，换一个吧' : '该名称已被其他棋手占用，换一个吧';
   nameCheckTimer = setTimeout(async () => {
-    const r = await apiFetch('GET', '/api/bot/name-check?name=' + encodeURIComponent(name));
+    const r = await apiFetch('GET', checkUrl + '?name=' + encodeURIComponent(name));
     if (name !== $('bot-name').value.trim()) return; // 输入已变化，丢弃过期结果
     if (!r.ok) return;
     if (r.available) { errEl.textContent = '名称可用 ✓'; errEl.classList.add('ok'); }
-    else { errEl.textContent = '该名称已被其他棋手占用，换一个吧'; }
+    else { errEl.textContent = busyMsg; }
   }, 350);
 });
 
-function openCreateBot() {
-  avatarMode = 'create'; selectedAvatar = 'preset:1'; pendingUploadDataUrl = null;
+function resetAvatarPickerModal() {
   $('bot-name').value = ''; $('err-botname').textContent = ''; $('err-botname').classList.remove('ok');
   $('bot-name').closest('.field').classList.remove('hidden');
   $('createBotBtn').classList.remove('hidden');
+  selectedAvatar = 'preset:1'; pendingUploadDataUrl = null;
+}
+function openCreateBot() {
+  avatarCtx = { kind: 'bot', mode: 'create' };
+  resetAvatarPickerModal();
+  $('bot-name').placeholder = '例如：落叶';
   document.querySelector('#createBotModal h2').textContent = '创建棋手';
+  document.querySelector('#createBotModal .field label').textContent = '棋手名称';
+  $('createBotBtn').textContent = '创建棋手';
+  renderAvatarPicker(); openModal('createBotModal');
+}
+function openCreatePrisoner() {
+  avatarCtx = { kind: 'prisoner', mode: 'create' };
+  resetAvatarPickerModal();
+  $('bot-name').placeholder = '例如：镜面囚徒';
+  document.querySelector('#createBotModal h2').textContent = '创建囚徒';
+  document.querySelector('#createBotModal .field label').textContent = '囚徒名称';
+  $('createBotBtn').textContent = '创建囚徒';
   renderAvatarPicker(); openModal('createBotModal');
 }
 function openAvatarEditor() {
-  avatarMode = 'edit'; pendingUploadDataUrl = null;
+  avatarCtx = { kind: 'bot', mode: 'edit' };
+  pendingUploadDataUrl = null;
   selectedAvatar = (ME && ME.bot && ME.bot.avatar.startsWith('preset:')) ? ME.bot.avatar : 'preset:1';
+  $('bot-name').closest('.field').classList.add('hidden');
+  $('createBotBtn').classList.add('hidden');
+  document.querySelector('#createBotModal h2').textContent = '更换头像';
+  renderAvatarPicker(); openModal('createBotModal');
+}
+function openPrisonerAvatarEditor(currentAvatar) {
+  avatarCtx = { kind: 'prisoner', mode: 'edit' };
+  pendingUploadDataUrl = null;
+  selectedAvatar = (typeof currentAvatar === 'string' && currentAvatar.startsWith('preset:')) ? currentAvatar : 'preset:1';
   $('bot-name').closest('.field').classList.add('hidden');
   $('createBotBtn').classList.add('hidden');
   document.querySelector('#createBotModal h2').textContent = '更换头像';
@@ -406,15 +442,26 @@ function openAvatarEditor() {
 
 $('createBotBtn').addEventListener('click', async () => {
   const name = $('bot-name').value.trim();
-  if (!name) { $('err-botname').textContent = '请填写棋手名称'; return; }
+  const isPrisoner = avatarCtx.kind === 'prisoner';
+  if (!name) { $('err-botname').textContent = isPrisoner ? '请填写囚徒名称' : '请填写棋手名称'; return; }
+  const checkUrl = isPrisoner ? '/api/prisoner/name-check' : '/api/bot/name-check';
+  const busyMsg = isPrisoner ? '该名称已被其他囚徒占用，换一个吧' : '该名称已被其他棋手占用，换一个吧';
   // 提交前再查一次占用，避免输入后未触发防抖检查就直接提交
-  const chk = await apiFetch('GET', '/api/bot/name-check?name=' + encodeURIComponent(name));
-  if (chk.ok && !chk.available) { $('err-botname').classList.remove('ok'); $('err-botname').textContent = '该名称已被其他棋手占用，换一个吧'; return; }
+  const chk = await apiFetch('GET', checkUrl + '?name=' + encodeURIComponent(name));
+  if (chk.ok && !chk.available) { $('err-botname').classList.remove('ok'); $('err-botname').textContent = busyMsg; return; }
   const presetForCreate = selectedAvatar === 'upload' ? 'preset:1' : selectedAvatar;
-  const r = await apiFetch('POST', '/api/bot/create', { name, avatar: presetForCreate });
-  if (!r.ok) { $('err-botname').classList.remove('ok'); $('err-botname').textContent = r.error || '创建失败'; return; }
-  if (pendingUploadDataUrl) await apiFetch('POST', '/api/bot/me/avatar', { dataUrl: pendingUploadDataUrl });
-  closeModal('createBotModal'); await refreshMe(); showDetail(); toast('棋手已创建');
+  if (isPrisoner) {
+    const r = await apiFetch('POST', '/api/prisoner/create', { name, avatar: presetForCreate });
+    if (!r.ok) { $('err-botname').classList.remove('ok'); $('err-botname').textContent = r.error || '创建失败'; return; }
+    if (pendingUploadDataUrl) await apiFetch('POST', '/api/prisoner/me/avatar', { dataUrl: pendingUploadDataUrl });
+    MY_PRISONER_ID = r.prisonerId;
+    closeModal('createBotModal'); toast('囚徒已创建'); renderMyPrisoner();
+  } else {
+    const r = await apiFetch('POST', '/api/bot/create', { name, avatar: presetForCreate });
+    if (!r.ok) { $('err-botname').classList.remove('ok'); $('err-botname').textContent = r.error || '创建失败'; return; }
+    if (pendingUploadDataUrl) await apiFetch('POST', '/api/bot/me/avatar', { dataUrl: pendingUploadDataUrl });
+    closeModal('createBotModal'); await refreshMe(); showDetail(); toast('棋手已创建');
+  }
 });
 
 $('avatarFile').addEventListener('change', (e) => {
@@ -427,41 +474,115 @@ $('avatarFile').addEventListener('change', (e) => {
 });
 
 // ---- 方形裁剪器 ----
-const crop = { img: null, base: 1, zoom: 1, x: 0, y: 0, dragging: false, lx: 0, ly: 0 };
+// 画布 288，其中居中的 240×240 白框才是最终头像区域（白框外仅作预览、导出时裁掉）。
+// baseFit=把整张图“放进”白框的缩放（contain）→ 默认 zoom=100% 即完整显示整图；放大可裁掉多余。
+// 坐标 x/y 为图片左上角在画布缓冲坐标系中的位置；拖拽按显示/缓冲比例换算，导出用独立离屏画布，
+// 均不依赖画布在屏幕上的实际显示尺寸。
+const CROP_CANVAS = 288, CROP_FRAME = 240, CROP_MARGIN = (CROP_CANVAS - CROP_FRAME) / 2, CROP_OUT = 256;
+const CROP_BG = '#eef7fd'; // 头像底色（不透明），非正方图片留白与页面底色一致
+const crop = { img: null, baseFit: 1, zoom: 1, x: 0, y: 0, dragging: false, lx: 0, ly: 0, sx: 1, sy: 1 };
+function roundRectPath(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
 function drawCrop() {
   const cv = $('cropCanvas'), ctx = cv.getContext('2d');
-  ctx.clearRect(0, 0, 256, 256);
+  ctx.clearRect(0, 0, CROP_CANVAS, CROP_CANVAS);
   if (!crop.img) return;
-  const s = crop.base * crop.zoom, w = crop.img.width * s, h = crop.img.height * s;
+  // 1) 头像底色 + 图片
+  ctx.fillStyle = CROP_BG; ctx.fillRect(0, 0, CROP_CANVAS, CROP_CANVAS);
+  const s = crop.baseFit * crop.zoom, w = crop.img.width * s, h = crop.img.height * s;
   ctx.drawImage(crop.img, crop.x, crop.y, w, h);
+  // 2) 压暗白框外区域（上/下/左/右四条）
+  const M = CROP_MARGIN, F = CROP_FRAME;
+  ctx.fillStyle = 'rgba(47,72,88,.42)';
+  ctx.fillRect(0, 0, CROP_CANVAS, M);
+  ctx.fillRect(0, CROP_CANVAS - M, CROP_CANVAS, M);
+  ctx.fillRect(0, M, M, F);
+  ctx.fillRect(CROP_CANVAS - M, M, M, F);
+  // 3) 白框边 + 四角标记
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.strokeRect(M, M, F, F);
+  ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.beginPath();
+  const t = 18;
+  ctx.moveTo(M, M + t); ctx.lineTo(M, M); ctx.lineTo(M + t, M);
+  ctx.moveTo(M + F - t, M); ctx.lineTo(M + F, M); ctx.lineTo(M + F, M + t);
+  ctx.moveTo(M + F, M + F - t); ctx.lineTo(M + F, M + F); ctx.lineTo(M + F - t, M + F);
+  ctx.moveTo(M + t, M + F); ctx.lineTo(M, M + F); ctx.lineTo(M, M + F - t);
+  ctx.stroke();
+  // 4) 圆角虚线：提示头像最终呈现为圆角方形
+  ctx.strokeStyle = 'rgba(255,255,255,.55)'; ctx.lineWidth = 1.5; ctx.setLineDash([6, 5]);
+  roundRectPath(ctx, M + 6, M + 6, F - 12, F - 12, 26); ctx.stroke(); ctx.setLineDash([]);
+}
+// 夹取图片位置：图片≥框时保证盖满框（可平移不留白）；图片<框时保持整图留在框内（留白居中可微调）
+function clampAxis(pos, drawLen, frameStart) {
+  const frameEnd = frameStart + CROP_FRAME;
+  if (drawLen >= CROP_FRAME) return Math.min(frameStart, Math.max(frameEnd - drawLen, pos));
+  return Math.max(frameStart, Math.min(frameEnd - drawLen, pos));
 }
 function clampCrop() {
-  const s = crop.base * crop.zoom, w = crop.img.width * s, h = crop.img.height * s;
-  crop.x = Math.min(0, Math.max(256 - w, crop.x));
-  crop.y = Math.min(0, Math.max(256 - h, crop.y));
+  const s = crop.baseFit * crop.zoom, w = crop.img.width * s, h = crop.img.height * s;
+  crop.x = clampAxis(crop.x, w, CROP_MARGIN);
+  crop.y = clampAxis(crop.y, h, CROP_MARGIN);
 }
 function openCropper(img) {
   crop.img = img; crop.zoom = 1;
-  crop.base = Math.max(256 / img.width, 256 / img.height);
-  const w = img.width * crop.base, h = img.height * crop.base;
-  crop.x = (256 - w) / 2; crop.y = (256 - h) / 2;
+  crop.baseFit = Math.min(CROP_FRAME / img.width, CROP_FRAME / img.height); // contain 进白框
+  const w = img.width * crop.baseFit, h = img.height * crop.baseFit;
+  crop.x = CROP_MARGIN + (CROP_FRAME - w) / 2; crop.y = CROP_MARGIN + (CROP_FRAME - h) / 2;
   $('cropZoom').value = 100;
   openModal('cropModal'); drawCrop();
 }
 const cv = $('cropCanvas');
-cv.addEventListener('pointerdown', (e) => { crop.dragging = true; crop.lx = e.offsetX; crop.ly = e.offsetY; cv.setPointerCapture(e.pointerId); });
-cv.addEventListener('pointermove', (e) => { if (!crop.dragging) return; crop.x += e.offsetX - crop.lx; crop.y += e.offsetY - crop.ly; crop.lx = e.offsetX; crop.ly = e.offsetY; clampCrop(); drawCrop(); });
+cv.addEventListener('pointerdown', (e) => {
+  crop.dragging = true;
+  const r = cv.getBoundingClientRect();
+  crop.sx = cv.width / r.width; crop.sy = cv.height / r.height; // 显示→缓冲 换算比
+  crop.lx = e.clientX; crop.ly = e.clientY;
+  cv.setPointerCapture(e.pointerId);
+});
+cv.addEventListener('pointermove', (e) => {
+  if (!crop.dragging) return;
+  crop.x += (e.clientX - crop.lx) * crop.sx; crop.y += (e.clientY - crop.ly) * crop.sy;
+  crop.lx = e.clientX; crop.ly = e.clientY;
+  clampCrop(); drawCrop();
+});
 cv.addEventListener('pointerup', () => { crop.dragging = false; });
-$('cropZoom').addEventListener('input', (e) => { crop.zoom = +e.target.value / 100; clampCrop(); drawCrop(); });
+cv.addEventListener('pointercancel', () => { crop.dragging = false; });
+$('cropZoom').addEventListener('input', (e) => {
+  // 以白框中心为锚点缩放，避免图片跳动
+  const cx = CROP_MARGIN + CROP_FRAME / 2, cy = cx;
+  const sOld = crop.baseFit * crop.zoom;
+  const ptX = (cx - crop.x) / sOld, ptY = (cy - crop.y) / sOld;
+  crop.zoom = +e.target.value / 100;
+  const sNew = crop.baseFit * crop.zoom;
+  crop.x = cx - ptX * sNew; crop.y = cy - ptY * sNew;
+  clampCrop(); drawCrop();
+});
 $('cropConfirm').addEventListener('click', async () => {
-  let dataUrl = $('cropCanvas').toDataURL('image/png');
-  if (dataUrl.length * 0.75 > 100 * 1024) dataUrl = $('cropCanvas').toDataURL('image/jpeg', 0.85);
+  // 用独立离屏画布确定性导出白框内容 → 与屏幕显示尺寸无关
+  const out = document.createElement('canvas'); out.width = out.height = CROP_OUT;
+  const octx = out.getContext('2d');
+  octx.fillStyle = CROP_BG; octx.fillRect(0, 0, CROP_OUT, CROP_OUT);
+  const k = CROP_OUT / CROP_FRAME, s = crop.baseFit * crop.zoom;
+  octx.drawImage(crop.img, (crop.x - CROP_MARGIN) * k, (crop.y - CROP_MARGIN) * k,
+    crop.img.width * s * k, crop.img.height * s * k);
+  let dataUrl = out.toDataURL('image/png');
+  if (dataUrl.length * 0.75 > 100 * 1024) dataUrl = out.toDataURL('image/jpeg', 0.85);
   pendingUploadDataUrl = dataUrl; selectedAvatar = 'upload';
   closeModal('cropModal'); renderAvatarPicker();
-  if (avatarMode === 'edit') {
-    const r = await apiFetch('POST', '/api/bot/me/avatar', { dataUrl });
-    if (r.ok) { await refreshMe(); toast('头像已更新'); closeModal('createBotModal'); showDetail(); }
-    else toast(r.error || '更新失败');
+  if (avatarCtx.mode === 'edit') {
+    const url = avatarCtx.kind === 'prisoner' ? '/api/prisoner/me/avatar' : '/api/bot/me/avatar';
+    const r = await apiFetch('POST', url, { dataUrl });
+    if (!r.ok) return toast(r.error || '更新失败');
+    toast('头像已更新');
+    closeModal('createBotModal');
+    if (avatarCtx.kind === 'prisoner') renderMyPrisoner();
+    else { await refreshMe(); showDetail(); }
   }
 });
 
@@ -1377,16 +1498,9 @@ async function renderMyPrisoner() {
   const r = await apiFetch('GET', '/api/prisoner/me');
   if (r.__status === 404) {
     MY_PRISONER_ID = null;
-    box.innerHTML = `<div class="empty-hero"><h2>还没有囚徒</h2><p>给你的囚徒起个名字，选一个头像；脚本由你/Agent 稍后提交。</p>
-      <div class="field" style="max-width:320px;margin:18px auto"><input id="pdNewName" placeholder="囚徒名称" /><div class="field-err" id="pdNewErr"></div></div>
-      <button class="primary" id="pdCreateBtn">创建囚徒</button></div>`;
-    $('pdCreateBtn').onclick = async () => {
-      const name = $('pdNewName').value.trim();
-      if (!name) { $('pdNewErr').textContent = '请填写名称'; return; }
-      const c = await apiFetch('POST', '/api/prisoner/create', { name, avatar: 'preset:1' });
-      if (c.ok) { MY_PRISONER_ID = c.prisonerId; toast('囚徒创建成功'); renderMyPrisoner(); }
-      else $('pdNewErr').textContent = c.error || '创建失败';
-    };
+    box.innerHTML = `<div class="empty-hero"><h2>你还没有囚徒</h2><p>创建一名囚徒，选一个头像；策略脚本由你/Agent 稍后提交。</p>
+      <button class="primary" id="pdCreateOpen">创建囚徒 →</button></div>`;
+    $('pdCreateOpen').addEventListener('click', openCreatePrisoner);
     return;
   }
   if (!r.ok) { box.innerHTML = `<div class="muted-center">${esc(r.error)}</div>`; return; }
@@ -1397,6 +1511,7 @@ async function renderMyPrisoner() {
     <div class="detail-head">
       <div class="av">${avatarHtml(p.avatar)}</div>
       <div><h2>${esc(p.name)}</h2><div class="muted">当前工作版本：v${p.currentVersion}${empty ? '（空脚本）' : ''}</div></div>
+      <div style="margin-left:auto"><button class="mini" id="editPrisonerAvatarBtn">更换头像</button></div>
     </div>
     <div class="detail-grid">
       <div class="card">
@@ -1407,6 +1522,7 @@ async function renderMyPrisoner() {
         <div class="ov-row"><span>胜率</span><b>${p.winRate == null ? '—' : p.winRate + '%'}</b></div>
         <div class="ov-row"><span>战绩</span><b>${p.wins}-${p.losses}-${p.draws}</b></div>
         <div class="ov-row"><span>状态</span>${empty ? '<span class="chip empty">待提交脚本</span>' : '<span class="chip active">可对战</span>'}</div>
+        <div class="ov-row"><span>当前版本</span><b>v${p.currentVersion}${empty ? '（空脚本）' : ''}</b></div>
       </div>
       <div class="card">
         <h3>Agent 接入</h3>
@@ -1424,6 +1540,7 @@ async function renderMyPrisoner() {
       <button class="subtab" data-psub="matches">对战记录</button>
     </div>
     <div id="psubBody"></div>`;
+  $('editPrisonerAvatarBtn').addEventListener('click', () => openPrisonerAvatarEditor(p.avatar));
   $('pdCopyPromptBtn').addEventListener('click', async () => {
     const pr = await apiFetch('GET', '/api/prisoner/me/prompt');
     if (!pr.ok) return toast(pr.error || '获取失败');
@@ -1520,6 +1637,7 @@ async function showPublicPrisoner(prisonerId) {
         <div class="ov-row"><span>当前排名</span><b>#${p.rankPosition || '—'}</b></div>
         <div class="ov-row"><span>胜率</span><b>${p.winRate == null ? '—' : p.winRate + '%'}</b></div>
         <div class="ov-row"><span>战绩</span><b>${p.wins}-${p.losses}-${p.draws}</b></div>
+        <div class="ov-row"><span>当前版本</span><b>v${p.currentVersion}${p.status === 'empty' ? '（空脚本）' : ''}</b></div>
       </div>
       <div class="card">
         <h3>最近对战（${battles.length}）</h3>

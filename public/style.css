@@ -262,6 +262,9 @@ select:focus,input:focus,textarea:focus { outline:none; border-color:var(--mint)
 .ov-row:last-child { border-bottom:none; }
 .ov-row span:first-child { color:var(--muted); }
 .ov-row b { font-weight:700; }
+/* 上传头像：无论落在哪个容器（天梯榜/我的棋手/详情头部/囚徒各页）都铺满并等比裁切，
+   避免 <img> 按原始 256×256 渲染被 overflow:hidden 截成左上角 */
+.av-img { width:100%; height:100%; display:block; object-fit:cover; }
 .detail-head { display:flex; align-items:center; gap:16px; margin-bottom:18px; }
 .detail-head .av { width:72px; height:72px; border-radius:18px; overflow:hidden; }
 .detail-head h2 { margin:0; }
@@ -324,7 +327,7 @@ select:focus,input:focus,textarea:focus { outline:none; border-color:var(--mint)
 .modal-foot { text-align:center; color:var(--muted); font-size:13px; margin:14px 0 0; }
 .code-view { background:var(--sky); border-radius:12px; padding:14px; overflow:auto; max-height:60vh; font-size:13px; line-height:1.6; }
 .crop-stage { display:flex; justify-content:center; margin-bottom:14px; }
-#cropCanvas { border-radius:14px; background:var(--sky); cursor:grab; touch-action:none; }
+#cropCanvas { border-radius:14px; background:var(--sky); cursor:grab; touch-action:none; max-width:100%; height:auto; }
 .popup-icon { width:52px; height:52px; border-radius:50%; background:var(--coral-soft); color:var(--coral); display:flex; align-items:center; justify-content:center; margin:6px auto 12px; font-size:26px; }
 .popup-actions { display:flex; gap:10px; margin-top:18px; }
 .popup-actions button { flex:1; }
