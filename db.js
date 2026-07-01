@@ -433,9 +433,11 @@ function encodeMoves(history) {
   return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 }
 function decodeMoves(buf, totalRounds) {
-  const N = totalRounds;
-  const out = new Array(N);
   const u = buf instanceof Uint8Array ? buf : Buffer.from(buf);
+  // 防御性夹取：绝不越过 blob 实际编码的容量（每字节 4 回合）读到未写入的尾部，
+  // 否则会解出假的 CC。调用方应传「真实进行回合数」；这里再兜一层上限。
+  const N = Math.max(0, Math.min(totalRounds | 0, u.length * 4));
+  const out = new Array(N);
   for (let i = 0; i < N; i++) {
     const byteIdx = i >> 2;
     const shift = (3 - (i & 3)) * 2;
@@ -592,13 +594,10 @@ module.exports = {
     return stmtGetPrisonerBattle.get(args.matchUrlId);
   },
   getPrisonerBattle(urlId) {
-    const row = stmtGetPrisonerBattle.get(urlId);
-    if (!row) return null;
-    // 解码 move_blob：以 history.length 为准（reason!=completed 时回放至中止处）
-    // 我们用 actual_rounds 作为编码长度；若失败提前结束，history 实际 < actual_rounds，
-    // 但编码时已按真实 history.length 编码 → 这里用 failure_detail.round 判定实际有效条数。
-    // 简化：始终按 actual_rounds 解码，无效末尾在前端按 reason 处理（P0 满意）。
-    return row;
+    // move_blob 按真实 history.length 编码（reason!=completed 时 < actual_rounds）。
+    // 解码长度由调用方（server.js 的 /api/match/prisoner 路由）按 reason/failure.round
+    // 算出「真实进行回合数」传入，decodeMoves 再夹取到 blob 容量，杜绝解出假 CC。
+    return stmtGetPrisonerBattle.get(urlId) || null;
   },
   decodePrisonerMoves: decodeMoves,
   listPrisonerBattles(id, limit = 20) { return stmtListPrisonerBattles.all(id, id, limit); },

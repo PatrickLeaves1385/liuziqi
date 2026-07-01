@@ -7,6 +7,9 @@ const crypto = require('crypto');
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 const COOKIE_NAME = 'sx_session';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
+// 生产（HTTPS）下给会话 Cookie 加 Secure，禁止其在明文 http 上回传；
+// 本地/非生产不加，便于 http://localhost 预览调试。
+const IS_PROD = process.env.NODE_ENV === 'production';
 
 // ---- 密码 ----
 function hashPassword(password) {
@@ -90,10 +93,10 @@ function parseCookies(req) {
 function sessionCookie(accountId) {
   const token = makeToken(accountId);
   const maxAge = Math.floor(SESSION_TTL_MS / 1000);
-  return `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`;
+  return `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${IS_PROD ? '; Secure' : ''}`;
 }
 function clearCookie() {
-  return `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
+  return `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${IS_PROD ? '; Secure' : ''}`;
 }
 // 从请求取已登录 accountId（无效/未登录返回 null）
 function sessionAccountId(req) {

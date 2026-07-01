@@ -1463,16 +1463,35 @@ route('GET', /^\/api\/agent\/prisoner-opponents\/(\d+)\/matches$/, (req, res, ma
 });
 
 // ---- 公开 ----
-route('GET', '/api/leaderboard/prisoner', (req, res) => {
+// 微缓存（P0）：与钳王天梯同构——榜单仅在对局结束后变化，可容忍数秒陈旧。缓存序列化 JSON + ETag，
+// TTL 内复用省去查库/序列化，并配合 Cache-Control 让浏览器/反代短缓存或走 304，抵御后端偶发卡顿。
+const PD_LEADERBOARD_TTL_MS = 10000;
+let pdLbCache = null; // { body, etag, expires }
+function prisonerLeaderboardPayload() {
+  const now = Date.now();
+  if (pdLbCache && pdLbCache.expires > now) return pdLbCache;
   const rows = db.listPrisoners();
-  sendJson(res, 200, { ok: true, leaderboard: rows.map((p, i) => ({
+  const body = JSON.stringify({ ok: true, leaderboard: rows.map((p, i) => ({
     rank: i + 1, prisonerId: p.id, name: p.name, avatar: p.avatar,
     nickname: p.nickname, rp: p.rp, rankName: rankLabel(p.rp),
     wins: p.wins, losses: p.losses, draws: p.draws,
     currentVersion: p.current_version,
-  })) }, {
-    'Cache-Control': 'public, max-age=10',
-  });
+  })) });
+  const etag = '"' + crypto.createHash('sha1').update(body).digest('base64') + '"';
+  pdLbCache = { body, etag, expires: now + PD_LEADERBOARD_TTL_MS };
+  return pdLbCache;
+}
+route('GET', '/api/leaderboard/prisoner', (req, res) => {
+  const { body, etag } = prisonerLeaderboardPayload();
+  const headers = {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Cache-Control': 'public, max-age=10, stale-while-revalidate=60',
+    ETag: etag,
+  };
+  if (req.headers['if-none-match'] === etag) { res.writeHead(304, headers); return res.end(); }
+  res.writeHead(200, headers);
+  res.end(body);
 });
 
 route('GET', /^\/api\/prisoners\/(\d+)\/public$/, (req, res, m) => {
@@ -1506,7 +1525,15 @@ route('GET', /^\/api\/match\/prisoner\/([a-z0-9]+)$/, (req, res, match) => {
   if (!row) return sendJson(res, 404, { ok: false, error: '对局不存在' });
   const ch = db.getPrisonerById(row.challenger_prisoner_id);
   const cd = db.getPrisonerById(row.challenged_prisoner_id);
-  const moves = db.decodePrisonerMoves(row.move_blob, row.actual_rounds);
+  const failure = row.failure_detail ? JSON.parse(row.failure_detail) : null;
+  // 真实进行的回合数：completed 时 = actual_rounds；中途判负时 = failure.round − 1
+  // （引擎在失败回合把选择 push 进 history 之前就返回，故 history 只含此前完成的回合）。
+  // move_blob 按 history.length 编码——必须按同一长度解码，否则会把 blob 里没写过的尾部
+  // 读成假的 CC（明明是背叛/超时判负，回放却显示成一路互相合作）。
+  const playedRounds = row.reason === 'completed'
+    ? row.actual_rounds
+    : (failure && Number.isInteger(failure.round) ? Math.max(0, failure.round - 1) : row.actual_rounds);
+  const moves = db.decodePrisonerMoves(row.move_blob, playedRounds);
   sendJson(res, 200, { ok: true, match: {
     matchUrlId: row.match_url_id, playedAt: row.played_at,
     challenger: { id: ch?.id, name: ch?.name, avatar: ch?.avatar },
@@ -1516,8 +1543,8 @@ route('GET', /^\/api\/match\/prisoner\/([a-z0-9]+)$/, (req, res, match) => {
     chScore: row.ch_score, cdScore: row.cd_score,
     chRpDelta: row.ch_rp_delta, cdRpDelta: row.cd_rp_delta,
     scored: row.scored, seed: row.seed,
-    failure: row.failure_detail ? JSON.parse(row.failure_detail) : null,
-    moves, // [{a:'C'|'D', b:'C'|'D'}, ...]
+    failure,
+    moves, // [{a:'C'|'D', b:'C'|'D'}, ...]（长度 = 真实进行回合数）
   } });
 });
 
@@ -1728,6 +1755,16 @@ const server = http.createServer(async (req, res) => {
 // 防止「反代复用的连接被 Node 先行关闭」导致偶发 502/重连。
 server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
+
+// 进程级兜底：单进程部署下，一个漏网的 Promise 拒绝（Node ≥15 默认会终止进程）或
+// 未捕获异常不应拖垮整个服务。请求级错误已在 http handler 的 try/catch 里兜住，这里只兜
+// 极少数逃逸情形——记日志后继续服务，把「是否重启」交给 PM2（真·致命崩溃它仍会拉起）。
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason && reason.stack ? reason.stack : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+});
 
 server.listen(PORT, () => {
   console.log(`钳王争霸 Agent 平台已启动: http://localhost:${PORT}`);
