@@ -7,7 +7,11 @@
 //   - 交给玩家代码的计量对象只暴露安全 API,不含 _reset/_rawApply 等内部方法,
 //     避免脚本调用 _reset 自行重置预算、或用 _rawApply 绕过计量。
 //   - 引擎与训练棋手用无计量的静态 Rules(含 _rawApply/_counts)。
-const core = require('./rules_core');
+// UMD：Node 下 require rules_core；浏览器经 /builtin-bots.js 复用 window.GameRules（同一事实源）。
+(function (root, factory) {
+  if (typeof module !== 'undefined' && module.exports) module.exports = factory(require('./rules_core'));
+  else root.GameRulesMetered = factory(root.GameRules);
+})(typeof self !== 'undefined' ? self : this, function (core) {
 const { clone, other, legalMoves, judge, counts, apply: rawApply } = core;
 
 // 每手一个计量实例:交给棋手代码使用。只暴露安全 API(legalMoves/apply/judge/clone/other/remaining)。
@@ -27,4 +31,5 @@ function makeRules(budget) {
 // 引擎/训练棋手用的无计量静态视图(含内部 _rawApply/_counts,绝不注入玩家沙箱)
 const Rules = { legalMoves, judge, clone, other, _counts: counts, _rawApply: rawApply };
 
-module.exports = { Rules, makeRules };
+return { Rules, makeRules };
+});

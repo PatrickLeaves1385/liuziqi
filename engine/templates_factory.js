@@ -1,7 +1,12 @@
 'use strict';
 // 模板工厂:四套评估的关键权重参数化
 // w = { blockMob: 封锁派机动权重, rulDef: 裁定派被威胁惩罚, cenThreat: 抢中派威胁权重, cenCenter: 抢中派中心权重 }
-const { Rules } = require('./rules_metered');
+// UMD：Node 下 require rules_metered；浏览器复用 window.GameRulesMetered（/builtin-bots.js）。
+(function (root, factory) {
+  if (typeof module !== 'undefined' && module.exports) module.exports = factory(require('./rules_metered'));
+  else root.ClawTemplates = factory(root.GameRulesMetered);
+})(typeof self !== 'undefined' ? self : this, function (metered) {
+const { Rules } = metered;
  
 const WIN = 1000000;
 const CENTER = new Set(['1,1', '2,1', '1,2', '2,2']);
@@ -167,5 +172,6 @@ function makeTemplates(w) {
   ];
 }
  
-module.exports = { makeTemplates };
+return { makeTemplates };
+});
  

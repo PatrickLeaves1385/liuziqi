@@ -1,6 +1,11 @@
 'use strict';
 // 囚徒困境规则核心：收益矩阵 + 回合数区间。
 // 与策划案 v1.0 §2 一致；前后端共享同一事实源。
+// UMD：Node 下 module.exports；浏览器经 /builtin-bots.js 挂到 window.PdRules。
+(function (root, factory) {
+  if (typeof module !== 'undefined' && module.exports) module.exports = factory();
+  else root.PdRules = factory();
+})(typeof self !== 'undefined' ? self : this, function () {
 
 // 单回合收益：[我的选择][对方选择] -> 我的得分。
 //   CC=3 / CD=0 / DC=5 / DD=1
@@ -32,4 +37,5 @@ function sampleRounds(rnd01) {
   return MIN_ROUNDS + Math.floor(rnd01 * span);
 }
 
-module.exports = { PAYOFF, MIN_ROUNDS, MAX_ROUNDS, normalizeChoice, sampleRounds };
+return { PAYOFF, MIN_ROUNDS, MAX_ROUNDS, normalizeChoice, sampleRounds };
+});

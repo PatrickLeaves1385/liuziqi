@@ -1,7 +1,12 @@
 'use strict';
 // 三档训练棋手：牧童（随机）/ 石郎（贪吃）/ 棋圣（2 层子力）
 // 仅保证棋局正常进行，不纳入四套评估流派（§P1-1 不采纳）
-const { Rules } = require('./rules_metered');
+// UMD：Node 下 require rules_metered；浏览器复用 window.GameRulesMetered（/builtin-bots.js）。
+(function (root, factory) {
+  if (typeof module !== 'undefined' && module.exports) module.exports = factory(require('./rules_metered'));
+  else root.ClawTraining = factory(root.GameRulesMetered);
+})(typeof self !== 'undefined' ? self : this, function (metered) {
+const { Rules } = metered;
 
 function makeRandom(rnd) {
   return {
@@ -85,4 +90,5 @@ function getTrainingBot(id) {
   return def.make();
 }
 
-module.exports = { TRAINING_BOTS, getTrainingBot };
+return { TRAINING_BOTS, getTrainingBot };
+});

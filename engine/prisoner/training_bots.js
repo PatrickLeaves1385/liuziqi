@@ -2,6 +2,11 @@
 // 三名训练囚徒：永远合作 / 永远背叛 / 50% 抛硬币
 // 仅用于烟雾测试 + 试玩页对手名册；不计入段位。
 // 严格无状态：仅依赖 game.random / opponent.history 等入参。
+// UMD：Node 下 module.exports；浏览器经 /builtin-bots.js 挂到 window.PdTraining。
+(function (root, factory) {
+  if (typeof module !== 'undefined' && module.exports) module.exports = factory();
+  else root.PdTraining = factory();
+})(typeof self !== 'undefined' ? self : this, function () {
 
 function makeAlwaysCooperate() {
   return {
@@ -36,4 +41,5 @@ function getTrainingBot(id) {
   return def.make();
 }
 
-module.exports = { TRAINING_BOTS, getTrainingBot };
+return { TRAINING_BOTS, getTrainingBot };
+});

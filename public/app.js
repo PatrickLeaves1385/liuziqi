@@ -1023,10 +1023,29 @@ function applyPlayResult(r,{animate=false,prevFrames=0}={}){
   }
 }
 
+// ---- 内置对手：浏览器内直接构造（/builtin-bots.js，与服务器同一份可信代码）----
+// 供试玩「本地应手」用；玩家上传脚本(不可信)仍走服务器沙箱，clientBot 为 null 时自动回退。
+function makeClientBuiltin(name){
+  try{ return (window.ClawBuiltins&&ClawBuiltins.findBuiltin(name))||null; }catch{ return null; }
+}
+// 与 engine/engine_quota.js 同款随机源/取子：保证前端内置对手应手与服务器逐手一致。
+function mulberry32(a){
+  return function(){
+    a|=0;a=(a+0x6D2B79F5)|0;
+    let t=Math.imul(a^(a>>>15),1|a);
+    t=(t+Math.imul(t^(t>>>7),61|t))^t;
+    return ((t^(t>>>14))>>>0)/4294967296;
+  };
+}
+function piecesOf(board,side){
+  const p=[];
+  for(let x=0;x<4;x++)for(let y=0;y<4;y++)if(board[x][y]===side)p.push([x,y]);
+  return p;
+}
 // ---- 前端本地推演：复刻 engine/play_session.js，与服务器共享 /game-rules.js 规则核心 ----
-// 「机器人应手」留给服务器（沙箱执行不可信脚本）：AI 模式推进到机器人回合即停下标记 needBot；
-// local（双人同屏）模式整局自洽，全程无需服务器。
-function runLocalPlay(rawHistory, mode, humanSide){
+// AI 模式：内置对手(bot!=null)浏览器本地应手，零网络；玩家上传脚本(bot==null)推进到机器人回合即
+// 停下标记 needBot 交服务器沙箱。local（双人同屏）模式整局自洽，全程无需服务器。
+function runLocalPlay(rawHistory, mode, humanSide, bot){
   let board=GameRules.initBoard();
   let side='black', turn=1, ncm=0, lastPass=false;
   const history=[]; let status=null, needBot=false;
@@ -1055,7 +1074,27 @@ function runLocalPlay(rawHistory, mode, humanSide){
     const moves=GameRules.legalMoves(board,side);
     if(moves.length===0){applyPass();continue;} // 无合法走法自动停一手
     if(mode==='local'||side===humanSide)break;  // 轮到人类，停下等输入
-    needBot=true; break;                         // AI 模式：轮到机器人，交给服务器
+    if(!bot){needBot=true;break;}                // 玩家上传脚本(不可信)：轮到机器人交服务器沙箱
+    // 内置对手：浏览器本地算出应手（复刻 engine/play_session.js 机器人分支，含每手计量与同款随机源）
+    const oppSide=GameRules.other(side);
+    const myPieces=piecesOf(board,side),opPieces=piecesOf(board,oppSide);
+    const game={
+      board:GameRules.clone(board),turnNumber:turn,noCaptureMoves:ncm,
+      legalMoves:moves.map((m)=>({from:m.from.slice(),to:m.to.slice()})),
+      history,random:mulberry32((0x5EED^(turn*2654435761))>>>0),
+      rules:GameRulesMetered.makeRules(100),
+    };
+    let mv;
+    try{
+      mv=bot.onTurn(
+        {side,pieces:myPieces,capturedCount:6-myPieces.length},
+        {side:oppSide,pieces:opPieces,capturedCount:6-opPieces.length},
+        game,
+      );
+    }catch{finish(humanSide,'error');break;} // 内置对手异常（理论不达）：判人类胜，避免卡死
+    const okMv=mv&&mv.from&&mv.to&&moves.some((m)=>m.from[0]===mv.from[0]&&m.from[1]===mv.from[1]&&m.to[0]===mv.to[0]&&m.to[1]===mv.to[1]);
+    if(!okMv){finish(humanSide,'illegal');break;}
+    applyStep(mv);
   }
   const toMove=status?null:(mode==='local'?side:humanSide);
   const legal=(status||needBot)?[]:GameRules.legalMoves(board,toMove);
@@ -1067,9 +1106,9 @@ function runLocalPlay(rawHistory, mode, humanSide){
   };
 }
 // 本地推演 + 渲染（双人同屏全程、AI 人类落子即时反馈、悔棋回放都走这里，零网络）
-function localApply(history,{animate=false}={}){
+function localApply(history,{animate=false,bot=null}={}){
   const prevFrames=state.frames.length;
-  const r=runLocalPlay(history, play.mode, play.humanSide);
+  const r=runLocalPlay(history, play.mode, play.humanSide, bot);
   applyPlayResult(r,{animate,prevFrames});
   return r;
 }
@@ -1089,15 +1128,17 @@ async function startPlay(){
   const opt=sel.options[sel.selectedIndex];
   play.opp=sel.value.startsWith('bot:')
     ?{type:'bot',botId:+sel.value.slice(4),name:opt.dataset.name||opt.textContent}
-    :{type:'builtin',name:sel.value};
+    :{type:'builtin',name:sel.value,clientBot:makeClientBuiltin(sel.value)};
   play.mode='ai';play.started=true;play.over=false;play.humanSide=$('sideSel').value;
   play.history=[];play.legal=[];play.sel=null;play.undosLeft=3;play.busy=false;play.resultShown=false;
   state.match=null;state.frames=[];state.cur=0;
   $('statusLine').textContent='对局开始…';
   if(play.humanSide==='black'){
     localApply([],{animate:false});      // 人类执黑先行：本地初始化，零延迟
+  }else if(play.opp.clientBot){
+    localApply([],{animate:false,bot:play.opp.clientBot}); // 内置对手：机器人（黑）先手本地应手，零网络
   }else{
-    const r=await postPlay([]);           // 人类执红：机器人（黑）先手，服务器走第一手
+    const r=await postPlay([]);           // 玩家棋手：机器人（黑）先手，服务器走第一手
     if(!r){play.started=false;updateUndoBtn();return;}
   }
   toast(`对局开始：你执${play.humanSide==='black'?'梭子蟹（黑方 · 先手）':'龙虾（红方 · 后手）'}，对手「${play.opp.name}」`);
@@ -1131,11 +1172,13 @@ function onCellClick(x,y){
 // 人类落子：双人同屏全程本地；AI 模式先本地即时落子（零延迟），再异步取机器人应手
 async function doHumanMove(newHistory){
   if(play.mode==='local'){ localApply(newHistory,{animate:true}); return; }
+  const bot=play.opp&&play.opp.clientBot;
   const prevHistory=play.history;
   const interim=localApply(newHistory,{animate:false}); // 人类这步立即落子渲染（不等网络）
-  if(interim.status.over) return;     // 人类落子即终局，无需服务器
+  if(interim.status.over) return;     // 人类落子即终局，无需应手
   if(!interim.needBot) return;        // 机器人被迫停手并已轮回人类，本地已完成
-  const r=await postPlay(newHistory,{animate:true}); // 取机器人应手并播放
+  if(bot){ localApply(newHistory,{animate:true,bot}); return; } // 内置对手：浏览器本地应手并播放，零网络
+  const r=await postPlay(newHistory,{animate:true}); // 玩家棋手：取服务器沙箱应手并播放
   if(!r) localApply(prevHistory,{animate:false});    // 应手失败 → 回滚到落子前，恢复人类可走
 }
 function undoMove(){
@@ -1783,8 +1826,39 @@ function pdPlayPickOpponent(opp) {
   pdPlayReset(false); // 切换对手清零（保留对手）
 }
 
+// 训练囚徒 = 本仓库可信代码 → 浏览器内直接算出本回合选择（/builtin-bots.js，零网络）。
+// 与服务器 /api/prisoner/play 训练分支同款：me=训练囚徒自身视角，随机源按 roundNumber 复刻。
+function pdTrainingReply(id) {
+  try {
+    if (!window.PdTraining || !window.PdRules) return null;
+    const t = PdTraining.getTrainingBot(id);
+    const meHist = PDPlay.history.map((h) => h.opp); // 训练囚徒自己的历史选择
+    const opHist = PDPlay.history.map((h) => h.me);  // 训练囚徒眼里的对手 = 玩家
+    Object.freeze(meHist); Object.freeze(opHist);
+    const me = { score: PDPlay.oppScore, history: meHist };
+    const op = { score: PDPlay.myScore, history: opHist };
+    let s = ((PDPlay.history.length + 1) * 2654435761) >>> 0;
+    const random = () => { s = (s + 0x6D2B79F5) | 0; let r = Math.imul(s ^ (s >>> 15), 1 | s); r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r; return ((r ^ (r >>> 14)) >>> 0) / 4294967296; };
+    const game = { roundNumber: PDPlay.history.length + 1, random };
+    return PdRules.normalizeChoice(t.onRound(me, op, game));
+  } catch { return null; }
+}
+
 async function pdPlayMove(myMove) {
   if (!PDPlay.opponent || PDPlay.pending) return;
+  // 训练囚徒（可信自有代码）→ 浏览器本地即时结算，零网络
+  if (PDPlay.opponent.kind === 'training') {
+    const oppMove = pdTrainingReply(PDPlay.opponent.id);
+    if (oppMove) {
+      const myGain = PdRules.PAYOFF[myMove][oppMove], oppGain = PdRules.PAYOFF[oppMove][myMove];
+      PDPlay.history.push({ me: myMove, opp: oppMove });
+      PDPlay.myScore += myGain; PDPlay.oppScore += oppGain;
+      PDPlay.lastGain = { mine: myGain, opp: oppGain };
+      pdPlayRender();
+      return;
+    }
+    // 本地脚本未就绪（bundle 未加载）→ 落到服务器兜底
+  }
   PDPlay.pending = true;
   pdPlayRender();
   let r;
